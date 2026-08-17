@@ -1,0 +1,11 @@
+# Credentials -- never commit the app-specific password
+.env
+
+# Pre-change copies of contacts written by repair_contacts/update_contact
+backups/
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
