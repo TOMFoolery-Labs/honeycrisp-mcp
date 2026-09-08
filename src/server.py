@@ -120,8 +120,8 @@ needs calendar= when the account has several. Times are ISO 8601; a value withou
 offset is treated as UTC, so pass an offset for local times.
 
 Contacts: search_contacts matches the FN field server-side, so contacts with an empty \
-display name are only found with an empty query. create_contact, update_contact, \
-delete_contact and repair_contacts change the address book.
+display name are only found with an empty query. list_addressbooks names the address \
+books; create_contact, update_contact, delete_contact and repair_contacts change them.
 
 Every tool that changes data defaults to dry_run=True and returns exactly what it would \
 do. Show that preview to the user and get their confirmation before calling again with \

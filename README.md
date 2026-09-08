@@ -1,7 +1,8 @@
 # Honeycrisp
 
 A Model Context Protocol (MCP) server for iCloud — Mail, Calendar, Contacts and Notes —
-using an Apple app-specific password.
+using an Apple app-specific password. Twenty tools: read, search, send, edit and delete,
+every write previewed by default. All of them are verified against a real account.
 
 It talks to the open protocols Apple supports (IMAP and SMTP for mail, CalDAV for calendar,
 CardDAV for contacts), so no private API and no Apple ID password are involved.
@@ -91,7 +92,7 @@ Checkout:
 | `search_emails(folder, limit, sender, to, subject, text, since, before, unread, flagged, query)` | Search a mail folder with structured filters (ANDed) or, as an escape hatch, raw IMAP `query`. Returns sender, subject, date, flags and a decoded preview, newest first. |
 | `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
 | `list_calendars()` | Every calendar with its kind (events or reminders), writability, sharing and colour. |
-| `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. Each carries an `id` for `delete_event`. |
+| `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. Each carries an `id` for `update_event` and `delete_event`. |
 | `list_addressbooks()` | Every address book, for `create_contact`. |
 | `search_contacts(query, limit)` | Search all address books. Returns id, name, organization, and every email and phone per contact. |
 | `search_notes(query, limit)` | Legacy IMAP notes only — see the caveat below. |
@@ -114,13 +115,16 @@ Checkout:
 | `repair_contacts(dry_run, limit, contact_ids)` | Fix systematic contact data defects in bulk or for a chosen subset. |
 
 Every write tool defaults to `dry_run=True`: it reports exactly what would change and sends
-nothing. Pass `dry_run=False` to apply.
+nothing. Pass `dry_run=False` to apply. The server also sends usage guidance to the model in
+the MCP handshake (`instructions`), covering how the tools chain together and this
+preview-then-confirm convention.
 
 Mail:
 
 - **Trash first.** `delete_emails` moves messages to the account's Trash folder (`Deleted
-  Messages` on iCloud) with a single IMAP `MOVE`, so they stay recoverable. Deleting from
-  Trash itself requires `permanent=True`.
+  Messages` on iCloud), so they stay recoverable. It uses IMAP `MOVE` where the server
+  offers it and otherwise copy, flag and `UID EXPUNGE`; iCloud has no `MOVE`, so that
+  fallback is the live path. Deleting from Trash itself requires `permanent=True`.
 - **Permanent deletes are backed up.** With `permanent=True` each message is saved in full to
   `backups/mail-<timestamp>/` as an `.eml` file before it is expunged. Only the requested UIDs
   are expunged (`UID EXPUNGE`), never every `\Deleted` message in the folder.
@@ -153,6 +157,7 @@ Contacts:
 
 - **Creation is guarded.** `create_contact` PUTs with `If-None-Match: *`, so it can never
   overwrite an existing card, and needs `addressbook=` only when there are several.
+  `create_event` checks the event's URL the same way before writing.
 - **Surgical edits.** Only changed lines are rewritten; every other line — photos, custom
   properties, folded continuations — is preserved byte for byte.
 - **Backups.** Originals are saved to `backups/` as a timestamped `.vcf` before any write,
@@ -176,6 +181,12 @@ so such a contact cannot be found by name no matter what you pass — call with 
 value, e.g. `+12025550143X-SHARED-PHOTO-DISPLAY-PREF:ALWAYS_ASK`. The line arrives from
 Apple already joined, so this is bad data at rest rather than a parsing artifact. Reads
 strip the suffix and log a warning; `repair_contacts` splits it back onto its own line.
+
+**CardDAV throttling.** After many requests in a short time, iCloud answers every contacts
+request for the account with an empty HTTP 401 for several minutes, even though the
+credentials are fine. The server reports this as temporary throttling rather than an
+authentication failure, and caches address-book discovery for an hour so routine use makes
+one request per call instead of four. If you see it, wait a few minutes.
 
 **Notes.** Notes created in the modern Notes app sync over CloudKit, not IMAP, and are not
 reachable here. `search_notes` sees only notes stored on the IMAP account, which for most
@@ -201,7 +212,10 @@ accounts is empty. An empty result does not mean the user has no notes.
   Attachments are listed but never downloaded.
 - **The IMAP connection is cached** across tool calls and re-established when stale, because
   iCloud caps concurrent connections and throttles repeated logins. Access is serialised
-  with a lock, as `IMAPClient` is not thread-safe.
+  with a lock, as `IMAPClient` is not thread-safe. CardDAV discovery is cached too, for the
+  same reason.
+- **Event lookups go by URL.** iCloud rejects the CalDAV query-by-UID report, so events are
+  fetched at `<calendar>/<UID>.ics`, with the report kept as a fallback for other servers.
 - **Diagnostics go to stderr.** This is a stdio server, so stdout carries the JSON-RPC
   stream exclusively. Set `HONEYCRISP_LOG_LEVEL=DEBUG` for more detail.
 
@@ -217,10 +231,15 @@ Tests run fully offline against fakes in `tests/fakes.py` — no credentials, no
 account (needs `.env`) that also prints the server facts the mail tools rely on. On
 iCloud it shows no `MOVE` capability, so moves and deletes run the copy + flag +
 `UID EXPUNGE` fallback, and only Sent and Trash carry special-use flags.
-`scripts/roundtrip.py` is the live write check: it sends one tagged message to the account's
-own address, runs every mail write tool on it (mark, move, reply, delete, permanent delete)
-and removes every copy. It sends real mail, so run it deliberately. If a slow delivery trips
-it, `--resume <tag>` finishes the cleanup.
+`scripts/roundtrip.py` is the live mail write check: it sends one tagged message to the
+account's own address, runs every mail write tool on it (mark, move, reply, delete,
+permanent delete) and removes every copy. It sends real mail, so run it deliberately. If a
+slow delivery trips it, `--resume <tag>` finishes the cleanup. `scripts/roundtrip_pim.py`
+does the same for calendar and contacts: create, update and delete a tagged event on a
+non-shared calendar and a tagged contact, verifying each step and the backups
+(`--calendar` or `--contacts` runs one half). Space CardDAV-heavy runs out; see the
+throttling caveat above.
+
 The fixtures deliberately mirror bytes observed on a real account (CRLF line endings, empty
 `FN` with a populated `N`, an undecodable inline photo), because earlier fixtures that
 didn't hid real bugs. See `CLAUDE.md` for the architecture and the constraints behind it.
