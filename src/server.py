@@ -631,12 +631,8 @@ def delete_emails(
                     folder, {uid: _fetch_body_bytes(fetched.get(uid, {})) for uid in uids})
                 client.delete_messages(uids)
                 _expunge(client, uids)
-            elif client.has_capability("MOVE"):
-                client.move(uids, destination)
             else:
-                client.copy(uids, destination)
-                client.delete_messages(uids)
-                _expunge(client, uids)
+                _move_uids(client, uids, destination)
 
     return {
         "dry_run": dry_run,
@@ -647,6 +643,16 @@ def delete_emails(
         "backup": backup_path,
         "messages": messages,
     }
+
+
+def _move_uids(client: imapclient.IMAPClient, uids: List[int], destination: str) -> None:
+    """Move UIDs out of the selected folder, atomically where the server allows."""
+    if client.has_capability("MOVE"):
+        client.move(uids, destination)
+    else:
+        client.copy(uids, destination)
+        client.delete_messages(uids)
+        _expunge(client, uids)
 
 
 def _expunge(client: imapclient.IMAPClient, uids: List[int]) -> None:
@@ -660,6 +666,143 @@ def _expunge(client: imapclient.IMAPClient, uids: List[int]) -> None:
     else:
         log.warning("Server lacks UIDPLUS; expunging all \\Deleted messages in the folder.")
         client.expunge()
+
+
+_FOLDER_ROLES = {
+    b"\\Inbox": "inbox", b"\\Sent": "sent", b"\\Drafts": "drafts", b"\\Trash": "trash",
+    b"\\Junk": "junk", b"\\Archive": "archive", b"\\All": "all", b"\\Flagged": "flagged",
+}
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def list_folders() -> List[Dict[str, Any]]:
+    """
+    List every mail folder with its message counts and special role.
+
+    Use the 'name' values as the 'folder' argument to the other mail tools.
+    'role' is one of inbox, sent, drafts, trash, junk, archive or '' for an
+    ordinary folder; 'selectable' is False for containers that hold no mail.
+    """
+    with imap_session() as client:
+        try:
+            listing = client.list_folders()
+        except Exception as e:
+            raise ToolError(f"Could not list folders: {e}") from e
+
+        results = []
+        for flags, _delimiter, name in listing:
+            flags = tuple(flags or ())
+            role = next((r for f, r in _FOLDER_ROLES.items() if f in flags), "")
+            if not role and name.upper() == "INBOX":
+                role = "inbox"
+            selectable = b"\\Noselect" not in flags
+            entry: Dict[str, Any] = {"name": name, "role": role, "selectable": selectable,
+                                     "total": None, "unseen": None}
+            if selectable:
+                try:
+                    status = client.folder_status(name, ["MESSAGES", "UNSEEN"])
+                    entry["total"] = status.get(b"MESSAGES")
+                    entry["unseen"] = status.get(b"UNSEEN")
+                except Exception as e:
+                    log.debug("STATUS failed for %r: %s", name, e)
+            results.append(entry)
+        return results
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+def move_emails(
+    message_ids: List[str],
+    to_folder: str,
+    folder: str = "INBOX",
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Move emails from one folder to another (archive, file, or restore from Trash).
+
+    Args:
+        message_ids: The 'id' values from search_emails, specific to 'folder'.
+        to_folder: Destination folder name; see list_folders.
+        folder: The folder the messages currently live in (default 'INBOX').
+        dry_run: When True (the default) report what would move without touching anything.
+    """
+    uids = _parse_message_ids(message_ids)
+    to_folder = to_folder.strip()
+    if not to_folder:
+        raise ToolError("to_folder is required; see list_folders for names.")
+    if to_folder == folder:
+        raise ToolError(f"Messages are already in {folder!r}.")
+
+    with imap_session() as client:
+        try:
+            if not client.folder_exists(to_folder):
+                raise ToolError(f"Destination folder {to_folder!r} does not exist; see list_folders.")
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(f"Could not check folder {to_folder!r}: {e}") from e
+        try:
+            client.select_folder(folder, readonly=dry_run)
+        except Exception as e:
+            raise ToolError(f"Could not open folder {folder!r}: {e}") from e
+
+        messages = _describe_messages(client, uids, folder)
+        if not dry_run:
+            _move_uids(client, uids, to_folder)
+
+    return {
+        "dry_run": dry_run,
+        "moved": not dry_run,
+        "folder": folder,
+        "destination": to_folder,
+        "messages": messages,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
+def mark_emails(
+    message_ids: List[str],
+    folder: str = "INBOX",
+    read: Optional[bool] = None,
+    flagged: Optional[bool] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Mark emails as read/unread or flagged/unflagged.
+
+    Args:
+        message_ids: The 'id' values from search_emails, specific to 'folder'.
+        folder: The folder the messages live in (default 'INBOX').
+        read: True marks as read, False marks as unread, None leaves it alone.
+        flagged: True flags, False unflags, None leaves it alone.
+        dry_run: When True (the default) report what would change without touching anything.
+    """
+    if read is None and flagged is None:
+        raise ToolError("Nothing to do: pass read and/or flagged.")
+    uids = _parse_message_ids(message_ids)
+    add = [f for f, on in ((imapclient.SEEN, read), (imapclient.FLAGGED, flagged)) if on is True]
+    remove = [f for f, on in ((imapclient.SEEN, read), (imapclient.FLAGGED, flagged)) if on is False]
+
+    with imap_session() as client:
+        try:
+            client.select_folder(folder, readonly=dry_run)
+        except Exception as e:
+            raise ToolError(f"Could not open folder {folder!r}: {e}") from e
+
+        messages = _describe_messages(client, uids, folder)
+        if not dry_run:
+            if add:
+                client.add_flags(uids, add, silent=True)
+            if remove:
+                client.remove_flags(uids, remove, silent=True)
+
+    return {
+        "dry_run": dry_run,
+        "changed": not dry_run,
+        "folder": folder,
+        "add_flags": [f.decode() for f in add],
+        "remove_flags": [f.decode() for f in remove],
+        "messages": messages,
+    }
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})

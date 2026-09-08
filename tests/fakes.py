@@ -38,8 +38,12 @@ class FakeIMAP:
         self.noop_fails = False
         self.search_error = None
         self.fetch_error = None
+        # Optional per-folder (flags, total, unseen) for list_folders.
+        self.folder_info = {}
         self.moved = []
         self.copied = []
+        self.flags_added = []
+        self.flags_removed = []
         self.flagged_deleted = []
         self.expunged = []
         self.appended = []
@@ -66,6 +70,32 @@ class FakeIMAP:
         if self.fetch_error:
             raise self.fetch_error
         return {uid: self.messages[uid] for uid in uids if uid in self.messages}
+
+    def folder_exists(self, folder):
+        self.calls.append(("folder_exists", folder))
+        return folder in self.folders
+
+    def list_folders(self, directory="", pattern="*"):
+        self.calls.append(("list_folders",))
+        return [
+            (tuple(self.folder_info.get(name, ((), 0, 0))[0]), "/", name)
+            for name in sorted(self.folders)
+        ]
+
+    def folder_status(self, folder, what=None):
+        self.calls.append(("folder_status", folder))
+        if folder not in self.folders:
+            raise Exception(f"STATUS failed: [{folder}] Mailbox doesn't exist")
+        _, total, unseen = self.folder_info.get(folder, ((), 0, 0))
+        return {b"MESSAGES": total, b"UNSEEN": unseen}
+
+    def add_flags(self, uids, flags, silent=False):
+        self.calls.append(("add_flags", tuple(uids), tuple(flags)))
+        self.flags_added.append((tuple(uids), tuple(flags)))
+
+    def remove_flags(self, uids, flags, silent=False):
+        self.calls.append(("remove_flags", tuple(uids), tuple(flags)))
+        self.flags_removed.append((tuple(uids), tuple(flags)))
 
     def has_capability(self, capability):
         return capability in self.capabilities

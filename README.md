@@ -43,6 +43,7 @@ directory a client launches it from.
 
 | Tool | Description |
 | --- | --- |
+| `list_folders()` | Every mail folder with its role (inbox, sent, trash, ...) and message and unseen counts. |
 | `search_emails(query, folder, limit)` | Search a mail folder with an IMAP query. Returns sender, subject, date and a decoded body preview, newest first. |
 | `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
 | `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. |
@@ -53,6 +54,8 @@ directory a client launches it from.
 
 | Tool | Description |
 | --- | --- |
+| `move_emails(message_ids, to_folder, folder, dry_run)` | Move messages between folders: archive, file, or restore from Trash. |
+| `mark_emails(message_ids, folder, read, flagged, dry_run)` | Mark messages read/unread or flagged/unflagged. |
 | `delete_emails(message_ids, folder, permanent, dry_run)` | Move messages to Trash, or expunge them outright with `permanent=True`. |
 | `send_email(body, to, subject, cc, bcc, reply_to_id, reply_folder, dry_run)` | Send a plain-text email over SMTP and file a copy in Sent. Pass `reply_to_id` to reply in-thread. |
 | `update_contact(contact_id, name, phones, emails, dry_run)` | Edit one contact. |
@@ -69,7 +72,9 @@ Mail:
 - **Permanent deletes are backed up.** With `permanent=True` each message is saved in full to
   `backups/mail-<timestamp>/` as an `.eml` file before it is expunged. Only the requested UIDs
   are expunged (`UID EXPUNGE`), never every `\Deleted` message in the folder.
-- **All-or-nothing ids.** Ids are per-folder. If any id is not found, nothing is deleted.
+- **All-or-nothing ids.** Ids are per-folder. If any id is not found, nothing is deleted,
+  moved or marked. `move_emails` also checks that the destination exists before opening
+  the source folder.
 - **Replies thread properly.** With `reply_to_id`, `send_email` reads the original's headers
   and sets `In-Reply-To` and `References`, so the reply lands in the same conversation in
   every mail client. `to` defaults to the original's `Reply-To` or `From`, and `subject` to

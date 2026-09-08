@@ -20,7 +20,7 @@ Live checks against the real account require `.env` (`ICLOUD_EMAIL`, `ICLOUD_APP
 
 ## Architecture
 
-One module, `src/server.py`, exposing nine FastMCP tools over four protocols: IMAP for mail
+One module, `src/server.py`, exposing twelve FastMCP tools over four protocols: IMAP for mail
 and legacy notes, SMTP (stdlib `smtplib`, STARTTLS on 587) for sending, CalDAV (via the
 `caldav` lib) for calendar, and raw CardDAV over `requests` for contacts. `tests/fakes.py`
 provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` for fakes.
@@ -68,9 +68,10 @@ device is reported rather than clobbered. `contact_ids=[]` and `message_ids=[]` 
 than matching everything. Get explicit user confirmation before any `dry_run=False` run
 against the live account.
 
-**`delete_emails` fails whole, not partial.** Message ids are IMAP UIDs and are per-folder;
-if any requested id is missing from the folder the tool raises before acting on the rest.
-The default action is a single `MOVE` to Trash (found via `find_special_folder`, which is
+**Mail write tools fail whole, not partial.** Message ids are IMAP UIDs and are per-folder;
+`_describe_messages` raises if any requested id is missing, before anything is acted on.
+`delete_emails` and `move_emails` share `_move_uids` (MOVE, else copy + flag + expunge).
+The default delete action is a single `MOVE` to Trash (found via `find_special_folder`, which is
 `Deleted Messages` on iCloud). `permanent=True` writes each message to
 `backups/mail-<stamp>/*.eml` first, then flags `\Deleted` and issues `UID EXPUNGE` for
 just those UIDs; a plain `EXPUNGE` would also purge messages other clients flagged.
