@@ -1366,19 +1366,28 @@ def _event_by_uid(calendar: Any, uid: str) -> Optional[Any]:
     the REPORT is kept only as a fallback for servers that lay objects out
     differently.
     """
-    url = str(calendar.url).rstrip("/") + "/" + uid + ".ics"
     try:
-        event = caldav.Event(calendar.client, url=url, parent=calendar)
-        event.load()
-        return event
-    except NotFoundError:
-        pass
+        event = _event_at_url(calendar, uid)
     except Exception as e:
-        log.debug("Direct GET of %s failed: %s", url, e)
+        log.debug("Direct GET for %s in %r failed: %s", uid, calendar.name, e)
+        event = None
+    if event is not None:
+        return event
     try:
         return calendar.get_event_by_uid(uid)
     except NotFoundError:
         return None
+
+
+def _event_at_url(calendar: Any, uid: str) -> Optional[Any]:
+    """GET <calendar>/<uid>.ics; None on 404. Raises on any other failure."""
+    url = str(calendar.url).rstrip("/") + "/" + uid + ".ics"
+    event = caldav.Event(calendar.client, url=url, parent=calendar)
+    try:
+        event.load()
+    except NotFoundError:
+        return None
+    return event
 
 
 _CALENDAR_PROPFIND = (
@@ -1668,8 +1677,16 @@ def create_event(
     ical = _build_event_ical(uid, summary.strip(), start_value, end_value, location, description)
 
     if not dry_run:
+        # caldav's no_overwrite check uses the by-UID REPORT that iCloud answers
+        # with 412, so the existence check is a direct GET of the object URL.
         try:
-            target.add_event(ical=ical, no_overwrite=True)
+            existing = _event_at_url(target, uid)
+        except Exception as e:
+            raise ToolError(f"Could not check {target.name!r} for an existing event: {e}") from e
+        if existing is not None:
+            raise ToolError(f"An event with id {uid!r} already exists in {target.name!r}; nothing was written.")
+        try:
+            target.add_event(ical=ical)
         except Exception as e:
             raise ToolError(f"Creating the event in {target.name!r} failed: {e}") from e
 

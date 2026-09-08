@@ -97,7 +97,9 @@ def test_create_writes_a_well_formed_vevent_in_utc():
     )
     assert result["created"] is True
     [added] = cal.added
-    assert added["no_overwrite"] is True, "must never replace an existing object"
+    # iCloud 412s the library's own no_overwrite lookup, so existence is checked by
+    # a direct GET of <calendar>/<uid>.ics instead (see test below).
+    assert added["no_overwrite"] is False
     lines = vevent_lines(added["ical"])
     assert lines[0] == "BEGIN:VCALENDAR" and "BEGIN:VEVENT" in lines and lines[-2:] == ["END:VCALENDAR", ""]
     assert f"UID:{result['id']}" in lines
@@ -107,6 +109,20 @@ def test_create_writes_a_well_formed_vevent_in_utc():
     assert "LOCATION:12 Main St" in lines
     assert "DESCRIPTION:Line one\\nLine two" in lines
     assert any(line.startswith("DTSTAMP:") and line.endswith("Z") for line in lines)
+
+
+def test_create_refuses_to_overwrite_an_existing_object():
+    [cal] = use_calendars(FakeCalendar("Home"))
+    fixed = "11111111-2222-3333-4444-555555555555"
+    server.uuid.uuid4 = lambda: fixed
+    DirectEvent.store[f"{cal.url}{fixed.upper()}.ics"] = {"data": "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "event": target()}
+    try:
+        with pytest.raises(ToolError, match="already exists"):
+            server.create_event(summary="Dup", start="2026-09-10T15:00:00Z", dry_run=False)
+    finally:
+        import uuid as _uuid
+        server.uuid.uuid4 = _uuid.uuid4
+    assert cal.added == []
 
 
 def test_all_day_event_uses_date_values_and_next_day_end():
