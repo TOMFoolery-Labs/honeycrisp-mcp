@@ -672,6 +672,21 @@ _FOLDER_ROLES = {
     b"\\Inbox": "inbox", b"\\Sent": "sent", b"\\Drafts": "drafts", b"\\Trash": "trash",
     b"\\Junk": "junk", b"\\Archive": "archive", b"\\All": "all", b"\\Flagged": "flagged",
 }
+# iCloud flags only Sent and Trash in LIST (and does not advertise SPECIAL-USE),
+# so the rest are recognised by the names Apple and other providers use.
+_FOLDER_ROLE_NAMES = {
+    "inbox": "inbox",
+    "sent": "sent", "sent items": "sent", "sent messages": "sent",
+    "drafts": "drafts",
+    "trash": "trash", "deleted items": "trash", "deleted messages": "trash", "deleted": "trash",
+    "junk": "junk", "spam": "junk", "junk e-mail": "junk",
+    "archive": "archive",
+}
+
+
+def _folder_role(name: str, flags: Tuple[bytes, ...]) -> str:
+    role = next((r for f, r in _FOLDER_ROLES.items() if f in flags), "")
+    return role or _FOLDER_ROLE_NAMES.get(name.strip().lower(), "")
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -692,9 +707,7 @@ def list_folders() -> List[Dict[str, Any]]:
         results = []
         for flags, _delimiter, name in listing:
             flags = tuple(flags or ())
-            role = next((r for f, r in _FOLDER_ROLES.items() if f in flags), "")
-            if not role and name.upper() == "INBOX":
-                role = "inbox"
+            role = _folder_role(name, flags)
             selectable = b"\\Noselect" not in flags
             entry: Dict[str, Any] = {"name": name, "role": role, "selectable": selectable,
                                      "total": None, "unseen": None}

@@ -139,6 +139,10 @@ uv pip install -r requirements-dev.txt
 ```
 
 Tests run fully offline against fakes in `tests/fakes.py` — no credentials, no network.
+`scripts/smoke.py` is the complement: a read-only walk of every tool against the live
+account (needs `.env`) that also prints the server facts the mail tools rely on. On
+iCloud it shows no `MOVE` capability, so moves and deletes run the copy + flag +
+`UID EXPUNGE` fallback, and only Sent and Trash carry special-use flags.
 The fixtures deliberately mirror bytes observed on a real account (CRLF line endings, empty
 `FN` with a populated `N`, an undecodable inline photo), because earlier fixtures that
 didn't hid real bugs. See `CLAUDE.md` for the architecture and the constraints behind it.

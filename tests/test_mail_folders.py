@@ -57,6 +57,23 @@ def test_list_folders_reports_roles_and_counts():
     assert "Projects" not in [c[1] for c in tuples(client, "folder_status")]
 
 
+def test_roles_fall_back_to_well_known_names_when_the_server_sends_no_flags():
+    # Observed live: iCloud flags only \Sent and \Trash and omits SPECIAL-USE.
+    client = mailbox(folders=("INBOX", "Drafts", "Junk", "Archive", "Deleted Messages", "Sent Messages", "Outbox"))
+    roles = {f["name"]: f["role"] for f in server.list_folders()}
+    assert roles == {
+        "INBOX": "inbox", "Drafts": "drafts", "Junk": "junk", "Archive": "archive",
+        "Deleted Messages": "trash", "Sent Messages": "sent", "Outbox": "",
+    }
+
+
+def test_server_flags_win_over_names():
+    client = mailbox(folders=("INBOX", "Bin"))
+    client.folder_info = {"Bin": ((b"\\Trash",), 0, 0)}
+    roles = {f["name"]: f["role"] for f in server.list_folders()}
+    assert roles["Bin"] == "trash"
+
+
 def test_list_folders_survives_a_failed_status():
     client = mailbox(folders=("INBOX", "Odd"))
     real_status = client.folder_status

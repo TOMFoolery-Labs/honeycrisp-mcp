@@ -108,5 +108,9 @@ fixtures include a card whose inline photo is deliberately undecodable, because 
 - Some stored values arrive with a metadata property already concatenated on
   (`+12025550143X-SHARED-PHOTO-DISPLAY-PREF:ALWAYS_ASK`). The line arrives joined from
   Apple, so this is corrupt data at rest, not a parsing artifact.
+- **iCloud IMAP has no `MOVE` and no `SPECIAL-USE`** (verified 2026-09-08 with
+  `scripts/smoke.py`). `_move_uids` therefore always takes the copy + `\Deleted` +
+  `UID EXPUNGE` path live, and `list_folders` recognises Drafts/Junk/Archive by name.
+  `UIDPLUS` is present. Trash is `Deleted Messages`, Sent is `Sent Messages`.
 - **Notes sync over CloudKit, not IMAP.** `search_notes` reaches only legacy IMAP notes and
   is empty for most accounts; an empty result is not evidence the user has no notes.
