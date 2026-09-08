@@ -402,3 +402,102 @@ def test_non_reply_still_requires_to_and_subject():
         server.send_email(body="b", subject="s")
     with pytest.raises(ToolError, match="subject is required"):
         server.send_email(body="b", to=["a@example.com"])
+
+
+# --------------------------------------------------------------------------
+# forward_email
+# --------------------------------------------------------------------------
+
+import base64
+
+PDF = base64.b64encode(b"%PDF-1.4 fake").decode()
+WITH_ATTACHMENT = (
+    "From: Ann <ann@example.com>\r\nTo: test@icloud.com\r\nCc: bob@example.com\r\n"
+    "Subject: Q3 report\r\nDate: Mon, 07 Sep 2026 10:00:00 +0000\r\nMessage-ID: <q3@example.com>\r\n"
+    'MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="b1"\r\n\r\n'
+    "--b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nNumbers attached.\r\n"
+    "--b1\r\nContent-Type: application/pdf; name=q3.pdf\r\nContent-Disposition: attachment; filename=q3.pdf\r\n"
+    f"Content-Transfer-Encoding: base64\r\n\r\n{PDF}\r\n--b1--\r\n"
+).encode()
+
+
+def attachment_mailbox(raw=WITH_ATTACHMENT, **kwargs):
+    return mailbox(uids=[7], messages={7: {b"ENVELOPE": Envelope(subject=b"Q3 report"), b"BODY[]": raw}}, **kwargs)
+
+
+def test_forward_dry_run_renders_the_forwarded_block_and_attachments():
+    no_smtp()
+    client = attachment_mailbox()
+    result = server.forward_email("7", to=["carol@example.com"], body="FYI, see attached.")
+    assert result["dry_run"] is True and result["sent"] is False
+    assert result["subject"] == "Fwd: Q3 report"
+    assert result["forwarded_id"] == "7"
+    assert result["attachments"] == [{"filename": "q3.pdf", "content_type": "application/pdf", "size": 13}]
+    assert result["body"] == (
+        "FYI, see attached.\n"
+        "---------- Forwarded message ----------\n"
+        "From: Ann <ann@example.com>\n"
+        "Date: Mon, 07 Sep 2026 10:00:00 +0000\n"
+        "Subject: Q3 report\n"
+        "To: test@icloud.com\n"
+        "Cc: bob@example.com\n"
+        "\n"
+        "Numbers attached."
+    )
+    assert ("select_folder", "INBOX", True) in client.calls
+    [fetch] = tuples(client, "fetch")
+    assert fetch[2] == ("BODY.PEEK[]",), "the original must not be marked read"
+
+
+def test_forward_live_reattaches_and_threads():
+    smtp = FakeSMTP()
+    server._connect_smtp = lambda: smtp
+    imap = attachment_mailbox()
+    result = server.forward_email("7", to=["carol@example.com"], bcc=["dave@example.com"], dry_run=False)
+    assert result["sent"] is True and result["saved_to_sent"] is True
+    [delivery] = smtp.sent
+    assert delivery["to"] == ["carol@example.com", "dave@example.com"]
+    msg = delivery["message"]
+    assert msg["Subject"] == "Fwd: Q3 report" and msg["References"] == "<q3@example.com>"
+    assert msg["Bcc"] is None
+    parts = list(msg.iter_attachments())
+    assert [p.get_filename() for p in parts] == ["q3.pdf"]
+    assert parts[0].get_payload(decode=True) == b"%PDF-1.4 fake"
+    assert "Numbers attached." in msg.get_body(preferencelist=("plain",)).get_content()
+    [(folder, raw, _)] = imap.appended
+    assert folder == "Sent Messages" and b"q3.pdf" in raw
+
+
+def test_forward_can_drop_attachments():
+    no_smtp()
+    attachment_mailbox()
+    result = server.forward_email("7", to=["carol@example.com"], include_attachments=False)
+    assert result["attachments"] == []
+
+
+def test_forward_does_not_stack_fwd_prefixes_and_honours_subject_override():
+    no_smtp()
+    attachment_mailbox(WITH_ATTACHMENT.replace(b"Subject: Q3 report", b"Subject: FW: Q3 report"))
+    assert server.forward_email("7", to=["c@example.com"])["subject"] == "FW: Q3 report"
+    attachment_mailbox()
+    assert server.forward_email("7", to=["c@example.com"], subject="Look at this")["subject"] == "Look at this"
+
+
+def test_forward_validation():
+    no_smtp()
+    attachment_mailbox()
+    with pytest.raises(ToolError, match="At least one 'to'"):
+        server.forward_email("7", to=[])
+    with pytest.raises(ToolError, match="Invalid to address"):
+        server.forward_email("7", to=["nope"])
+    with pytest.raises(ToolError, match="99"):
+        server.forward_email("99", to=["c@example.com"])
+    with pytest.raises(ToolError, match="Nope"):
+        server.forward_email("7", to=["c@example.com"], folder="Nope")
+
+
+def test_forward_of_html_only_message_uses_converted_text():
+    no_smtp()
+    attachment_mailbox(b"From: a@example.com\r\nSubject: Hi\r\nContent-Type: text/html\r\n\r\n<p>Hello <b>there</b></p>")
+    result = server.forward_email("7", to=["c@example.com"])
+    assert result["body"].endswith("\n\nHello there") and "<b>" not in result["body"]

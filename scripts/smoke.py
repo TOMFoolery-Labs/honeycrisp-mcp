@@ -56,8 +56,20 @@ def folders():
 def recent():
     result = server.search_emails(limit=3)
     for m in result:
-        show(m["id"], f"{m['date']}  {m['from']!r}  {m['subject']!r}")
+        show(m["id"], f"{m['date']}  {m['from']!r}  {m['subject']!r}  unread={m['unread']} flagged={m['flagged']}")
     return result
+
+
+def structured_search(sample):
+    sender_word = sample["from"].split("<")[0].strip().split(" ")[0] if sample else ""
+    r = server.search_emails(sender=sender_word, since="2026-09-01", limit=3)
+    show(f"sender={sender_word!r} since=2026-09-01", f"{len(r)} hit(s); first: {r[0]['subject']!r}" if r else "no hits")
+    r = server.search_emails(unread=True, limit=3)
+    show("unread=True", f"{len(r)} hit(s)")
+    r = server.search_emails(text="unsubscribe", before="2026-09-08", limit=3)
+    show("text='unsubscribe' before=2026-09-08", f"{len(r)} hit(s)")
+    r = server.search_emails(subject="café", limit=3)
+    show("subject='café' (UTF-8 charset)", f"{len(r)} hit(s)")
 
 
 def header_fetch_shape(uid):
@@ -89,6 +101,8 @@ def dry_runs(uid):
         show("move_emails", f"destination={r['destination']!r} moved={r['moved']}")
     r = server.mark_emails([str(uid)], read=True)
     show("mark_emails", f"add={r['add_flags']} changed={r['changed']}")
+    r = server.forward_email(str(uid), to=["nobody@example.com"], body="(smoke test, not sent)")
+    show("forward_email", f"subject={r['subject']!r} attachments={len(r['attachments'])} sent={r['sent']}")
     r = server.send_email(body="(smoke test, not sent)", reply_to_id=str(uid))
     show("send_email reply", f"to={r['to']} subject={r['subject']!r} sent={r['sent']}")
     show("  in_reply_to", r["in_reply_to"])
@@ -154,6 +168,7 @@ def main():
     listing = step("list_folders", folders) or []
     trash_name = next((f["name"] for f in listing if f["role"] == "trash"), None)
     messages = step("search_emails (INBOX, newest 3)", recent) or []
+    step("search_emails structured filters", lambda: structured_search(messages[0] if messages else None))
     if messages:
         uid = int(messages[0]["id"])
         step("HEADER.FIELDS fetch key shape", lambda: header_fetch_shape(uid))

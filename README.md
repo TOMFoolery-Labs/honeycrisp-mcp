@@ -69,7 +69,7 @@ Checkout:
 | Tool | Description |
 | --- | --- |
 | `list_folders()` | Every mail folder with its role (inbox, sent, trash, ...) and message and unseen counts. |
-| `search_emails(query, folder, limit)` | Search a mail folder with an IMAP query. Returns sender, subject, date and a decoded body preview, newest first. |
+| `search_emails(folder, limit, sender, to, subject, text, since, before, unread, flagged, query)` | Search a mail folder with structured filters (ANDed) or, as an escape hatch, raw IMAP `query`. Returns sender, subject, date, flags and a decoded preview, newest first. |
 | `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
 | `list_calendars()` | Every calendar with its kind (events or reminders), writability, sharing and colour. |
 | `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. Each carries an `id` for `delete_event`. |
@@ -84,6 +84,7 @@ Checkout:
 | `move_emails(message_ids, to_folder, folder, dry_run)` | Move messages between folders: archive, file, or restore from Trash. |
 | `mark_emails(message_ids, folder, read, flagged, dry_run)` | Mark messages read/unread or flagged/unflagged. |
 | `delete_emails(message_ids, folder, permanent, dry_run)` | Move messages to Trash, or expunge them outright with `permanent=True`. |
+| `forward_email(message_id, to, folder, body, cc, bcc, include_attachments, subject, dry_run)` | Forward a message with its attachments, with an optional note on top. |
 | `send_email(body, to, subject, cc, bcc, reply_to_id, reply_folder, dry_run)` | Send a plain-text email over SMTP and file a copy in Sent. Pass `reply_to_id` to reply in-thread. |
 | `create_event(summary, start, end, calendar, all_day, location, description, dry_run)` | Create a timed or all-day event. |
 | `update_event(event_id, calendar, summary, start, end, location, description, dry_run)` | Change an event's title, time, location or notes; everything else is preserved. |
@@ -166,6 +167,11 @@ accounts is empty. An empty result does not mean the user has no notes.
 - **Errors are raised, not returned.** Tools raise `ToolError` so the client sees a real
   protocol error, never an error-shaped value a model could mistake for data. An invalid
   IMAP query fails loudly rather than silently falling back to returning all mail.
+- **Search filters compile to IMAP criteria.** `sender`, `to`, `subject`, `text`, `since`,
+  `before`, `unread` and `flagged` are handed to imapclient as a list, which quotes values
+  and formats dates itself, so there is no query string for a model to get wrong. Raw
+  `query` remains for `OR` and other things the filters cannot say, but cannot be combined
+  with them.
 - **Calendar queries are bounded.** Without `end_date` the range defaults to 90 days after
   `start_date` (`DEFAULT_CALENDAR_WINDOW`). A closed interval is also what makes recurrence
   expansion possible.

@@ -20,7 +20,7 @@ Live checks against the real account require `.env` (`ICLOUD_EMAIL`, `ICLOUD_APP
 
 ## Architecture
 
-One module, `src/server.py`, exposing nineteen FastMCP tools over four protocols: IMAP for mail
+One module, `src/server.py`, exposing twenty FastMCP tools over four protocols: IMAP for mail
 and legacy notes, SMTP (stdlib `smtplib`, STARTTLS on 587) for sending, CalDAV (via the
 `caldav` lib) for calendar, and raw CardDAV over `requests` for contacts. `tests/fakes.py`
 provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` for fakes.
@@ -42,6 +42,12 @@ desynchronised the protocol).
 **stdout is the JSON-RPC stream.** This is a stdio server. Never `print()`; all diagnostics
 go through `log` to stderr. `tests/test_mail.py` asserts stdout stays byte-empty on import,
 both with and without credentials.
+
+**Search criteria are a list, never a formatted string.** `_compile_search` returns a list
+so imapclient does the quoting and IMAP date formatting; the only string path is the raw
+`query` escape hatch, which cannot be mixed with the filters because a raw string inside a
+list gets quoted as one literal. Non-ASCII values set `charset="UTF-8"`, which iCloud
+accepts (verified 2026-09-08).
 
 **Tools raise `ToolError`; they never return error-shaped data.** Returning `[{"error": ...}]`
 gives a model something it will mistake for a result. Relatedly, never silently fall back to

@@ -199,8 +199,20 @@ def test_result_shape():
         "from": "Ann <ann@example.com>",
         "subject": "Hello",
         "date": "2026-08-17T10:00:00+00:00",
+        "unread": True,
+        "flagged": False,
         "body_preview": "Body text here",
     }]
+
+
+def test_flags_are_reported():
+    envelope = Envelope(subject=b"Hi")
+    msg = {**message(envelope), b"FLAGS": (b"\\Seen", b"\\Flagged")}
+    use(FakeIMAP(uids=[1], messages={1: msg}))
+    [result] = server.search_emails()
+    assert result["unread"] is False and result["flagged"] is True
+    fetch = next(c for c in server._imap_client.calls if isinstance(c, tuple) and c[0] == "fetch")
+    assert "FLAGS" in fetch[2]
 
 
 # --------------------------------------------------------------------------
@@ -246,3 +258,75 @@ def test_validation_error_keeps_the_connection():
     # A rejected SEARCH does not desynchronise the stream; no need to reconnect.
     assert not client.logged_out
     assert server._imap_client is client
+
+
+# --------------------------------------------------------------------------
+# Structured search filters compile to IMAP criteria
+# --------------------------------------------------------------------------
+
+def searched(client):
+    return next(c[1] for c in client.calls if isinstance(c, tuple) and c[0] == "search")
+
+
+def test_no_filters_means_all():
+    client = use(FakeIMAP(uids=[]))
+    server.search_emails()
+    assert searched(client) == ["ALL"]
+
+
+def test_filters_compile_to_a_criteria_list_that_imapclient_quotes():
+    from datetime import date
+    client = use(FakeIMAP(uids=[]))
+    server.search_emails(sender="Ann Example", to="me", subject='say "hi"', text="invoice",
+                         since="2026-09-01", before="2026-09-08", unread=True, flagged=False)
+    # A list, not a hand-built string: imapclient quotes values and formats dates.
+    assert searched(client) == [
+        "FROM", "Ann Example", "TO", "me", "SUBJECT", 'say "hi"', "TEXT", "invoice",
+        "SINCE", date(2026, 9, 1), "BEFORE", date(2026, 9, 8), "UNSEEN", "UNFLAGGED",
+    ]
+
+
+def test_read_and_flagged_variants():
+    client = use(FakeIMAP(uids=[]))
+    server.search_emails(unread=False, flagged=True)
+    assert searched(client) == ["SEEN", "FLAGGED"]
+
+
+def test_blank_filters_are_ignored():
+    client = use(FakeIMAP(uids=[]))
+    server.search_emails(sender="  ", subject="", since=" ")
+    assert searched(client) == ["ALL"]
+
+
+def test_dates_accept_iso_datetimes_and_reject_garbage():
+    from datetime import date
+    client = use(FakeIMAP(uids=[]))
+    server.search_emails(since="2026-09-01T10:00:00Z")
+    assert searched(client) == ["SINCE", date(2026, 9, 1)]
+    with pytest.raises(ToolError, match="since must be a date"):
+        server.search_emails(since="last tuesday")
+    with pytest.raises(ToolError, match="before .* must be after since"):
+        server.search_emails(since="2026-09-08", before="2026-09-01")
+
+
+def test_raw_query_is_passed_through_untouched():
+    client = use(FakeIMAP(uids=[]))
+    server.search_emails(query='OR FROM "ann" FROM "bob"')
+    assert searched(client) == 'OR FROM "ann" FROM "bob"'
+
+
+def test_raw_query_cannot_be_mixed_with_filters():
+    client = use(FakeIMAP(uids=[]))
+    with pytest.raises(ToolError, match="either 'query' or the structured filters"):
+        server.search_emails(query="UNSEEN", sender="ann")
+    assert not any(isinstance(c, tuple) and c[0] == "search" for c in client.calls)
+
+
+def test_non_ascii_filter_uses_utf8_charset():
+    class CharsetIMAP(FakeIMAP):
+        def search(self, criteria, charset=None):
+            self.calls.append(("search", criteria, charset))
+            return []
+    client = use(CharsetIMAP(uids=[]))
+    server.search_emails(text="café")
+    assert next(c for c in client.calls if c[0] == "search") == ("search", ["TEXT", "café"], "UTF-8")

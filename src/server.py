@@ -484,18 +484,85 @@ def _parse_recipients(values: Optional[List[str]], field: str) -> List[str]:
 # --------------------------------------------------------------------------
 
 
-@mcp.tool(annotations={"readOnlyHint": True})
-def search_emails(query: str = "ALL", folder: str = "INBOX", limit: int = 10) -> List[Dict[str, str]]:
+def _parse_search_date(value: str, field: str) -> date:
+    text = value.strip()
+    try:
+        return date.fromisoformat(text[:10]) if len(text) >= 10 and text[10:11] in ("", "T", " ") else date.fromisoformat(text)
+    except ValueError as e:
+        raise ToolError(f"{field} must be a date (YYYY-MM-DD), got {value!r}.") from e
+
+
+def _compile_search(
+    sender: Optional[str], to: Optional[str], subject: Optional[str], text: Optional[str],
+    since: Optional[str], before: Optional[str], unread: Optional[bool], flagged: Optional[bool],
+) -> List[Any]:
+    """Turn the structured filters into IMAP SEARCH criteria.
+
+    Returned as a list so imapclient quotes and date-formats each value; a
+    hand-built string would need its own escaping and is what went wrong
+    with model-written queries in the first place.
     """
-    Search for emails in a specific folder.
+    criteria: List[Any] = []
+    for keyword, value in (("FROM", sender), ("TO", to), ("SUBJECT", subject), ("TEXT", text)):
+        if value is not None and value.strip():
+            criteria += [keyword, value.strip()]
+    since_date = _parse_search_date(since, "since") if since and since.strip() else None
+    before_date = _parse_search_date(before, "before") if before and before.strip() else None
+    if since_date and before_date and before_date <= since_date:
+        raise ToolError(f"before ({before_date}) must be after since ({since_date}).")
+    if since_date:
+        criteria += ["SINCE", since_date]
+    if before_date:
+        criteria += ["BEFORE", before_date]
+    if unread is not None:
+        criteria.append("UNSEEN" if unread else "SEEN")
+    if flagged is not None:
+        criteria.append("FLAGGED" if flagged else "UNFLAGGED")
+    return criteria or ["ALL"]
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def search_emails(
+    query: Optional[str] = None,
+    folder: str = "INBOX",
+    limit: int = 10,
+    sender: Optional[str] = None,
+    to: Optional[str] = None,
+    subject: Optional[str] = None,
+    text: Optional[str] = None,
+    since: Optional[str] = None,
+    before: Optional[str] = None,
+    unread: Optional[bool] = None,
+    flagged: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Search a mail folder. Newest first, with a short decoded preview of each.
+
+    Prefer the structured filters; they are combined with AND. Substring
+    matches are case-insensitive. Use 'query' only for something the
+    filters cannot express, and not together with them.
 
     Args:
-        query: IMAP search query (e.g., 'UNSEEN', 'FROM "apple"', 'SUBJECT "hello"'). Default is 'ALL'.
-        folder: The mail folder to search (default 'INBOX').
-        limit: Maximum number of emails to return (most recent first).
+        query: Raw IMAP search criteria (e.g. 'OR FROM "ann" FROM "bob"').
+        folder: The mail folder to search (default 'INBOX'); see list_folders.
+        limit: Maximum number of emails to return.
+        sender: Substring of the From address or name.
+        to: Substring of the To address or name.
+        subject: Substring of the subject.
+        text: Substring anywhere in the headers or body.
+        since: Only mail on or after this date (YYYY-MM-DD).
+        before: Only mail before this date (YYYY-MM-DD, exclusive).
+        unread: True for unread only, False for read only.
+        flagged: True for flagged only, False for unflagged only.
     """
     if limit < 1:
         raise ToolError("limit must be at least 1.")
+    criteria = _compile_search(sender, to, subject, text, since, before, unread, flagged)
+    if query is not None and query.strip():
+        if criteria != ["ALL"]:
+            raise ToolError("Pass either 'query' or the structured filters, not both.")
+        criteria = query.strip()
+    charset = "UTF-8" if any(isinstance(c, str) and not c.isascii() for c in (criteria if isinstance(criteria, list) else [criteria])) else None
 
     with imap_session() as client:
         try:
@@ -506,11 +573,11 @@ def search_emails(query: str = "ALL", folder: str = "INBOX", limit: int = 10) ->
         # A malformed query must surface as an error. Silently falling back to
         # 'ALL' would return unfiltered mail that looks like a valid result set.
         try:
-            messages = client.search(query)
+            messages = client.search(criteria, charset=charset) if charset else client.search(criteria)
         except Exception as e:
             raise ToolError(
-                f"Invalid IMAP search query {query!r}: {e}. "
-                'Use IMAP syntax, e.g. \'UNSEEN\', \'FROM "apple"\', \'SUBJECT "hello"\'.'
+                f"Invalid IMAP search query {criteria!r}: {e}. "
+                "Prefer the structured filters (sender, subject, since, unread, ...)."
             ) from e
 
         if not messages:
@@ -522,7 +589,7 @@ def search_emails(query: str = "ALL", folder: str = "INBOX", limit: int = 10) ->
         # PEEK avoids setting \Seen, and the byte range keeps large messages
         # and attachments off the wire -- only a preview is ever returned.
         body_part = f"BODY.PEEK[]<0.{PREVIEW_FETCH_BYTES}>"
-        fetch_data = client.fetch(messages, ["ENVELOPE", body_part])
+        fetch_data = client.fetch(messages, ["ENVELOPE", "FLAGS", body_part])
 
         results = []
         for msg_id in reversed(messages):
@@ -534,11 +601,14 @@ def search_emails(query: str = "ALL", folder: str = "INBOX", limit: int = 10) ->
                 log.debug("Message %s returned no ENVELOPE; skipping.", msg_id)
                 continue
 
+            flags = tuple(data.get(b"FLAGS") or ())
             results.append({
                 "id": str(msg_id),
                 "from": _format_address(envelope.from_),
                 "subject": _decode_header_value(envelope.subject),
                 "date": envelope.date.isoformat() if envelope.date else "",
+                "unread": imapclient.SEEN not in flags,
+                "flagged": imapclient.FLAGGED in flags,
                 "body_preview": _extract_preview(_fetch_body_bytes(data)),
             })
 
@@ -919,7 +989,12 @@ def send_email(
     if dry_run:
         return result
 
-    recipients = to_list + cc_list + bcc_list
+    result.update(_deliver(message, address, to_list + cc_list + bcc_list))
+    return result
+
+
+def _deliver(message: EmailMessage, address: str, recipients: List[str]) -> Dict[str, bool]:
+    """Send over SMTP, then file a copy in Sent. Shared by send_email and forward_email."""
     smtp = _connect_smtp()
     try:
         smtp.send_message(message, from_addr=address, to_addrs=recipients)
@@ -927,11 +1002,10 @@ def send_email(
         raise ToolError(f"SMTP rejected the message: {e}") from e
     finally:
         _quiet_quit(smtp)
-    result["sent"] = True
 
     # iCloud's SMTP does not file outgoing mail; clients APPEND it themselves.
     # The message has already left, so a failure here is reported, not raised.
-    result["saved_to_sent"] = False
+    saved = False
     try:
         with imap_session() as client:
             sent_folder = _special_folder(client, SENT_FLAG)
@@ -940,10 +1014,126 @@ def send_email(
             else:
                 wire = message.as_bytes(policy=message.policy.clone(linesep="\r\n"))
                 client.append(sent_folder, wire, flags=[imapclient.SEEN])
-                result["saved_to_sent"] = True
+                saved = True
     except Exception as e:
         log.warning("Message sent but could not be filed in Sent: %s", e)
+    return {"sent": True, "saved_to_sent": saved}
+
+
+_FWD_PREFIX_RE = re.compile(r"(?i)^\s*(fwd?|wg|tr)\s*:\s*")
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def forward_email(
+    message_id: str,
+    to: List[str],
+    folder: str = "INBOX",
+    body: Optional[str] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    include_attachments: bool = True,
+    subject: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Forward an existing email, with its attachments, to new recipients. Preview first.
+
+    The forwarded copy carries your note (if any) above a 'Forwarded message'
+    block with the original's From, Date, Subject and To, then the original
+    text. Attachments are re-attached unless include_attachments is False.
+
+    Args:
+        message_id: The 'id' from search_emails.
+        to: Recipient addresses.
+        folder: Folder the original lives in (default 'INBOX').
+        body: Optional note to put above the forwarded message.
+        cc: Optional Cc recipients.
+        bcc: Optional Bcc recipients (not included in the headers).
+        include_attachments: Re-attach the original's attachments (default True).
+        subject: Override the subject; defaults to 'Fwd: <original subject>'.
+        dry_run: When True (the default) return the rendered message without sending.
+    """
+    address, _ = _require_credentials()
+    uid = _parse_message_ids([message_id])[0]
+    to_list = _parse_recipients(to, "to")
+    cc_list = _parse_recipients(cc, "cc")
+    bcc_list = _parse_recipients(bcc, "bcc")
+    if not to_list:
+        raise ToolError("At least one 'to' recipient is required.")
+
+    with imap_session() as client:
+        try:
+            client.select_folder(folder, readonly=True)
+        except Exception as e:
+            raise ToolError(f"Could not open folder {folder!r}: {e}") from e
+        raw = _fetch_raw_message(client, uid, folder, ["BODY.PEEK[]"])
+    original = email.message_from_bytes(raw, policy=email.policy.default)
+
+    original_subject = str(original["Subject"] or "").strip()
+    if subject is None or not subject.strip():
+        subject = original_subject if _FWD_PREFIX_RE.match(original_subject) else f"Fwd: {original_subject}".rstrip()
+
+    header_block = "\n".join(
+        f"{label}: {value}" for label, value in (
+            ("From", str(original["From"] or "")),
+            ("Date", str(original["Date"] or "")),
+            ("Subject", original_subject),
+            ("To", str(original["To"] or "")),
+            ("Cc", str(original["Cc"] or "")),
+        ) if value
+    )
+    sections = ["---------- Forwarded message ----------", header_block, "", _message_text(original, raw)]
+    if body and body.strip():
+        sections.insert(0, body.strip())
+    text = "\n".join(sections)
+
+    message = EmailMessage()
+    message["From"] = address
+    message["To"] = ", ".join(to_list)
+    if cc_list:
+        message["Cc"] = ", ".join(cc_list)
+    message["Subject"] = subject.strip()
+    message["Date"] = formatdate(localtime=True)
+    message["Message-ID"] = make_msgid(domain=address.rsplit("@", 1)[-1])
+    if original["Message-ID"]:
+        message["References"] = str(original["Message-ID"]).strip()
+    message.set_content(text)
+
+    attached = []
+    if include_attachments:
+        for part in _iter_attachments(original):
+            try:
+                payload = part.get_payload(decode=True) or b""
+                maintype, subtype = (part.get_content_type() or "application/octet-stream").split("/", 1)
+                message.add_attachment(payload, maintype=maintype, subtype=subtype, filename=part.get_filename() or "attachment")
+                attached.append({"filename": part.get_filename() or "", "content_type": part.get_content_type(), "size": len(payload)})
+            except Exception as e:
+                raise ToolError(f"Could not re-attach {part.get_filename()!r}: {e}") from e
+
+    result: Dict[str, Any] = {
+        "dry_run": dry_run,
+        "sent": False,
+        "from": address,
+        "to": to_list,
+        "cc": cc_list,
+        "bcc": bcc_list,
+        "subject": message["Subject"],
+        "body": text,
+        "attachments": attached,
+        "forwarded_id": str(uid),
+    }
+    if dry_run:
+        return result
+    result.update(_deliver(message, address, to_list + cc_list + bcc_list))
     return result
+
+
+def _iter_attachments(message: Any) -> List[Any]:
+    try:
+        return list(message.iter_attachments())
+    except Exception as e:
+        log.debug("Could not enumerate attachments: %s", e)
+        return []
 
 
 def _parse_iso(value: str, field: str) -> datetime:
