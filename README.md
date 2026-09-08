@@ -44,6 +44,7 @@ directory a client launches it from.
 | Tool | Description |
 | --- | --- |
 | `search_emails(query, folder, limit)` | Search a mail folder with an IMAP query. Returns sender, subject, date and a decoded body preview, newest first. |
+| `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
 | `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. |
 | `search_contacts(query, limit)` | Search all address books. Returns id, name, organization, and every email and phone per contact. |
 | `search_notes(query, limit)` | Legacy IMAP notes only — see the caveat below. |
@@ -53,7 +54,7 @@ directory a client launches it from.
 | Tool | Description |
 | --- | --- |
 | `delete_emails(message_ids, folder, permanent, dry_run)` | Move messages to Trash, or expunge them outright with `permanent=True`. |
-| `send_email(to, subject, body, cc, bcc, dry_run)` | Send a plain-text email over SMTP and file a copy in Sent. |
+| `send_email(body, to, subject, cc, bcc, reply_to_id, reply_folder, dry_run)` | Send a plain-text email over SMTP and file a copy in Sent. Pass `reply_to_id` to reply in-thread. |
 | `update_contact(contact_id, name, phones, emails, dry_run)` | Edit one contact. |
 | `repair_contacts(dry_run, limit, contact_ids)` | Fix systematic contact data defects in bulk or for a chosen subset. |
 
@@ -69,6 +70,10 @@ Mail:
   `backups/mail-<timestamp>/` as an `.eml` file before it is expunged. Only the requested UIDs
   are expunged (`UID EXPUNGE`), never every `\Deleted` message in the folder.
 - **All-or-nothing ids.** Ids are per-folder. If any id is not found, nothing is deleted.
+- **Replies thread properly.** With `reply_to_id`, `send_email` reads the original's headers
+  and sets `In-Reply-To` and `References`, so the reply lands in the same conversation in
+  every mail client. `to` defaults to the original's `Reply-To` or `From`, and `subject` to
+  `Re: <original>` (no stacked prefixes). The original text is not quoted automatically.
 - **Sent mail is filed.** iCloud's SMTP server does not save outgoing mail, so `send_email`
   appends a copy to the Sent folder after delivery, the same way Mail.app does. If that step
   fails the message has still gone out; the result says `saved_to_sent: false`.
@@ -112,7 +117,9 @@ accounts is empty. An empty result does not mean the user has no notes.
   expansion possible.
 - **Message previews are bounded.** Only the first 16 KB of each message is fetched
   (`PREVIEW_FETCH_BYTES`), using `BODY.PEEK` so mail is never marked read, and the text is
-  MIME-decoded before truncation to 500 characters.
+  MIME-decoded before truncation to 500 characters. `get_email` fetches the whole message,
+  still with `BODY.PEEK`, and caps the returned body at `max_chars` (20,000 by default).
+  Attachments are listed but never downloaded.
 - **The IMAP connection is cached** across tool calls and re-established when stale, because
   iCloud caps concurrent connections and throttles repeated logins. Access is serialised
   with a lock, as `IMAPClient` is not thread-safe.

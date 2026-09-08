@@ -214,6 +214,8 @@ def test_send_dry_run_is_the_default_and_renders_without_connecting():
         "bcc": [],
         "subject": "Hi",
         "body": "Hello Ann",
+        "in_reply_to": "",
+        "references": "",
     }
 
 
@@ -309,3 +311,94 @@ def test_missing_sent_folder_is_reported_not_raised():
     result = server.send_email(to=["ann@example.com"], subject="s", body="b", dry_run=False)
     assert result["sent"] is True and result["saved_to_sent"] is False
     assert not imap.appended
+
+
+# --------------------------------------------------------------------------
+# send_email: replies
+# --------------------------------------------------------------------------
+
+ORIGINAL = (
+    b"From: Ann Example <ann@example.com>\r\n"
+    b"To: test@icloud.com\r\n"
+    b"Subject: Lunch?\r\n"
+    b"Date: Mon, 07 Sep 2026 10:00:00 +0000\r\n"
+    b"Message-ID: <orig-1@example.com>\r\n"
+    b"References: <root-0@example.com>\r\n"
+    b"Content-Type: text/plain\r\n\r\n"
+    b"Are you free Tuesday?\r\n"
+)
+
+
+def original_mailbox(raw=ORIGINAL, **kwargs):
+    return mailbox(uids=[7], messages={7: {b"ENVELOPE": Envelope(subject=b"Lunch?"), b"BODY[]": raw}}, **kwargs)
+
+
+def test_reply_threads_onto_the_original_and_defaults_to_and_subject():
+    no_smtp()
+    client = original_mailbox()
+    result = server.send_email(body="Yes, noon works.", reply_to_id="7")
+    assert result["to"] == ["Ann Example <ann@example.com>"]
+    assert result["subject"] == "Re: Lunch?"
+    assert result["in_reply_to"] == "<orig-1@example.com>"
+    assert result["references"] == "<root-0@example.com> <orig-1@example.com>"
+    # Headers only, opened read-only, never marking the original as read.
+    assert ("select_folder", "INBOX", True) in client.calls
+    [fetch] = tuples(client, "fetch")
+    assert fetch[1] == (7,) and fetch[2][0].startswith("BODY.PEEK[HEADER.FIELDS")
+
+
+def test_reply_honours_reply_to_header_and_existing_re_prefix():
+    no_smtp()
+    raw = ORIGINAL.replace(b"Subject: Lunch?", b"Subject: RE: Lunch?").replace(
+        b"To: test@icloud.com", b"To: test@icloud.com\r\nReply-To: list@example.com")
+    original_mailbox(raw)
+    result = server.send_email(body="ok", reply_to_id="7")
+    assert result["to"] == ["list@example.com"]
+    assert result["subject"] == "RE: Lunch?", "must not stack Re: prefixes"
+
+
+def test_explicit_to_and_subject_override_reply_defaults():
+    no_smtp()
+    original_mailbox()
+    result = server.send_email(body="ok", reply_to_id="7", to=["bob@example.com"], subject="Moved")
+    assert result["to"] == ["bob@example.com"] and result["subject"] == "Moved"
+    assert result["in_reply_to"] == "<orig-1@example.com>"
+
+
+def test_reply_without_original_message_id_sends_unthreaded():
+    no_smtp()
+    original_mailbox(ORIGINAL.replace(b"Message-ID: <orig-1@example.com>\r\n", b""))
+    result = server.send_email(body="ok", reply_to_id="7")
+    assert result["in_reply_to"] == "" and result["references"] == ""
+
+
+def test_reply_to_missing_id_raises():
+    no_smtp()
+    original_mailbox()
+    with pytest.raises(ToolError, match="99"):
+        server.send_email(body="ok", reply_to_id="99")
+
+
+def test_reply_folder_is_respected():
+    no_smtp()
+    client = original_mailbox(folders=("INBOX", "Archive"))
+    server.send_email(body="ok", reply_to_id="7", reply_folder="Archive")
+    assert ("select_folder", "Archive", True) in client.calls
+
+
+def test_live_reply_carries_threading_headers_on_the_wire():
+    smtp = FakeSMTP()
+    server._connect_smtp = lambda: smtp
+    original_mailbox()
+    server.send_email(body="ok", reply_to_id="7", dry_run=False)
+    msg = smtp.sent[0]["message"]
+    assert msg["In-Reply-To"] == "<orig-1@example.com>"
+    assert msg["References"] == "<root-0@example.com> <orig-1@example.com>"
+
+
+def test_non_reply_still_requires_to_and_subject():
+    no_smtp()
+    with pytest.raises(ToolError, match="At least one 'to'"):
+        server.send_email(body="b", subject="s")
+    with pytest.raises(ToolError, match="subject is required"):
+        server.send_email(body="b", to=["a@example.com"])

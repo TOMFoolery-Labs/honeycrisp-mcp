@@ -20,7 +20,7 @@ Live checks against the real account require `.env` (`ICLOUD_EMAIL`, `ICLOUD_APP
 
 ## Architecture
 
-One module, `src/server.py`, exposing eight FastMCP tools over four protocols: IMAP for mail
+One module, `src/server.py`, exposing nine FastMCP tools over four protocols: IMAP for mail
 and legacy notes, SMTP (stdlib `smtplib`, STARTTLS on 587) for sending, CalDAV (via the
 `caldav` lib) for calendar, and raw CardDAV over `requests` for contacts. `tests/fakes.py`
 provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` for fakes.
@@ -78,6 +78,13 @@ just those UIDs; a plain `EXPUNGE` would also purge messages other clients flagg
 **iCloud SMTP does not file sent mail.** `send_email` APPENDs a copy to the Sent folder over
 IMAP after delivery. That step runs after the message has left, so it logs and reports
 `saved_to_sent: False` rather than raising. Bcc recipients go only in the SMTP envelope.
+Replies (`reply_to_id`) fetch only the threading headers of the original via
+`HEADER.FIELDS`, read-only and with PEEK, so replying never marks the original as read.
+
+**Body text goes through `_message_text`.** Both `search_emails` previews and `get_email`
+use it: text/plain preferred, otherwise HTML converted with `_html_to_text`, which drops
+`<style>`/`<script>`/`<head>`, turns block boundaries into line breaks and unescapes
+entities. Previews then collapse whitespace via `_truncate`; full bodies keep line structure.
 
 **`load_dotenv` resolves `.env` relative to the source file**, not the cwd — MCP clients
 launch servers from arbitrary directories.

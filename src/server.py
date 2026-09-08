@@ -22,7 +22,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.message import EmailMessage
-from email.utils import formatdate, getaddresses, make_msgid
+from email.utils import formatdate, getaddresses, make_msgid, parsedate_to_datetime
+from html import unescape as html_unescape
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
 from urllib.parse import urljoin
 from xml.sax.saxutils import escape as xml_escape
@@ -65,6 +66,9 @@ HTTP_TIMEOUT = 30
 # start of the first body part without pulling down attachments.
 PREVIEW_FETCH_BYTES = 16384
 PREVIEW_CHARS = 500
+
+# Default cap on the body text returned by get_email.
+DEFAULT_BODY_CHARS = 20000
 
 # Default window for calendar queries when no end date is given. CalDAV
 # recurrence expansion requires a closed interval, and an unbounded query
@@ -207,6 +211,11 @@ def get_caldav_client() -> caldav.DAVClient:
 # --------------------------------------------------------------------------
 
 _TAG_RE = re.compile(r"<[^>]+>")
+# Block-level HTML boundaries that should become line breaks in text output.
+_PARAGRAPH_END_RE = re.compile(r"(?i)<\s*/(?:p|h[1-6]|blockquote|pre|table)\s*>")
+_LINE_BREAK_RE = re.compile(r"(?i)<\s*(?:br\s*/?|/div|/tr|/li)\s*>")
+_HIDDEN_HTML_RE = re.compile(r"(?is)<\s*(style|script|head)\b.*?<\s*/\s*\1\s*>")
+_BLANK_LINES_RE = re.compile(r"\n\s*\n(?:\s*\n)+")
 _WS_RE = re.compile(r"\s+")
 
 
@@ -245,19 +254,22 @@ def _truncate(text: str, limit: int = PREVIEW_CHARS) -> str:
     return text[:limit] + "..." if len(text) > limit else text
 
 
-def _extract_preview(raw: bytes) -> str:
-    """Extract readable text from a (possibly truncated) raw MIME message.
+def _html_to_text(content: str) -> str:
+    content = _HIDDEN_HTML_RE.sub(" ", content)
+    content = _PARAGRAPH_END_RE.sub("\n\n", content)
+    content = _LINE_BREAK_RE.sub("\n", content)
+    content = _TAG_RE.sub(" ", content)
+    content = html_unescape(content)
+    lines = [_WS_RE.sub(" ", line).strip() for line in content.split("\n")]
+    return _BLANK_LINES_RE.sub("\n\n", "\n".join(lines)).strip()
+
+
+def _message_text(message: Any, raw: bytes) -> str:
+    """Return the readable body of a parsed message, preferring text/plain.
 
     Bodies are commonly base64 or quoted-printable encoded, so the raw bytes
     are not human-readable on their own; they must be decoded per-part.
     """
-    if not raw:
-        return ""
-    try:
-        message = email.message_from_bytes(raw, policy=email.policy.default)
-    except Exception:
-        return _truncate(raw.decode("utf-8", errors="replace"))
-
     part = None
     for preference in (("plain",), ("html",)):
         try:
@@ -279,8 +291,88 @@ def _extract_preview(raw: bytes) -> str:
     if not isinstance(content, str):
         return ""
     if (part.get_content_subtype() or "").lower() == "html":
-        content = _TAG_RE.sub(" ", content)
-    return _truncate(content)
+        return _html_to_text(content)
+    return content.replace("\r\n", "\n").strip("\n")
+
+
+def _extract_preview(raw: bytes) -> str:
+    """Extract a short readable preview from a (possibly truncated) raw message."""
+    if not raw:
+        return ""
+    try:
+        message = email.message_from_bytes(raw, policy=email.policy.default)
+    except Exception:
+        return _truncate(raw.decode("utf-8", errors="replace"))
+    return _truncate(_message_text(message, raw))
+
+
+def _header_datetime(message: Any) -> str:
+    try:
+        parsed = parsedate_to_datetime(str(message["Date"])) if message["Date"] else None
+    except Exception:
+        parsed = None
+    return parsed.isoformat() if parsed else str(message["Date"] or "")
+
+
+def _attachment_summary(message: Any) -> List[Dict[str, Any]]:
+    attachments = []
+    try:
+        parts = list(message.iter_attachments())
+    except Exception as e:
+        log.debug("Could not enumerate attachments: %s", e)
+        return attachments
+    for part in parts:
+        try:
+            payload = part.get_payload(decode=True) or b""
+        except Exception:
+            payload = b""
+        attachments.append({
+            "filename": part.get_filename() or "",
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+        })
+    return attachments
+
+
+def _fetch_raw_message(client: imapclient.IMAPClient, uid: int, folder: str, parts: List[str]) -> bytes:
+    fetched = client.fetch([uid], parts)
+    raw = _fetch_body_bytes(fetched.get(uid, {}))
+    if not raw:
+        raise ToolError(
+            f"No message with id {uid} in folder {folder!r}. Ids are specific to a "
+            "folder; re-run search_emails with the same folder."
+        )
+    return raw
+
+
+_REPLY_HEADERS = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES SUBJECT FROM REPLY-TO)]"
+_RE_PREFIX_RE = re.compile(r"(?i)^\s*(re|aw|sv|fwd?)\s*:\s*")
+
+
+def _reply_context(uid: int, folder: str) -> Dict[str, Any]:
+    """Read the headers needed to thread a reply onto an existing message."""
+    with imap_session() as client:
+        try:
+            client.select_folder(folder, readonly=True)
+        except Exception as e:
+            raise ToolError(f"Could not open folder {folder!r}: {e}") from e
+        raw = _fetch_raw_message(client, uid, folder, [_REPLY_HEADERS])
+
+    original = email.message_from_bytes(raw, policy=email.policy.default)
+    message_id = str(original["Message-ID"] or "").strip()
+    references = str(original["References"] or "").split()
+    if message_id and message_id not in references:
+        references.append(message_id)
+    reply_to = str(original["Reply-To"] or original["From"] or "").strip()
+    subject = str(original["Subject"] or "").strip()
+    if not _RE_PREFIX_RE.match(subject):
+        subject = f"Re: {subject}" if subject else "Re:"
+    return {
+        "message_id": message_id,
+        "references": references,
+        "reply_to": [reply_to] if reply_to else [],
+        "subject": subject,
+    }
 
 
 def _fetch_body_bytes(data: Dict[bytes, Any]) -> bytes:
@@ -437,6 +529,51 @@ def search_emails(query: str = "ALL", folder: str = "INBOX", limit: int = 10) ->
         return results
 
 
+@mcp.tool(annotations={"readOnlyHint": True})
+def get_email(message_id: str, folder: str = "INBOX", max_chars: int = DEFAULT_BODY_CHARS) -> Dict[str, Any]:
+    """
+    Fetch one email in full: headers, the decoded body, and attachment names.
+
+    The body is the text/plain part when present, otherwise the HTML part
+    converted to text. Attachments are listed but never downloaded. The
+    message is not marked as read.
+
+    Args:
+        message_id: The 'id' from search_emails.
+        folder: The folder the message lives in (default 'INBOX').
+        max_chars: Cap on the returned body length; 'truncated' says whether it hit.
+    """
+    if max_chars < 1:
+        raise ToolError("max_chars must be at least 1.")
+    uid = _parse_message_ids([message_id])[0]
+
+    with imap_session() as client:
+        try:
+            client.select_folder(folder, readonly=True)
+        except Exception as e:
+            raise ToolError(f"Could not open folder {folder!r}: {e}") from e
+        raw = _fetch_raw_message(client, uid, folder, ["BODY.PEEK[]"])
+
+    message = email.message_from_bytes(raw, policy=email.policy.default)
+    text = _message_text(message, raw)
+    truncated = len(text) > max_chars
+    return {
+        "id": str(uid),
+        "folder": folder,
+        "from": str(message["From"] or ""),
+        "to": str(message["To"] or ""),
+        "cc": str(message["Cc"] or ""),
+        "reply_to": str(message["Reply-To"] or ""),
+        "subject": str(message["Subject"] or ""),
+        "date": _header_datetime(message),
+        "message_id": str(message["Message-ID"] or "").strip(),
+        "in_reply_to": str(message["In-Reply-To"] or "").strip(),
+        "body": text[:max_chars] + ("..." if truncated else ""),
+        "truncated": truncated,
+        "attachments": _attachment_summary(message),
+    }
+
+
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
 def delete_emails(
     message_ids: List[str],
@@ -527,11 +664,13 @@ def _expunge(client: imapclient.IMAPClient, uids: List[int]) -> None:
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
 def send_email(
-    to: List[str],
-    subject: str,
     body: str,
+    to: Optional[List[str]] = None,
+    subject: Optional[str] = None,
     cc: Optional[List[str]] = None,
     bcc: Optional[List[str]] = None,
+    reply_to_id: Optional[str] = None,
+    reply_folder: str = "INBOX",
     dry_run: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -542,24 +681,43 @@ def send_email(
     undone, so the default is a dry run that renders the message without
     sending it.
 
+    To reply to a message, pass its 'id' from search_emails as reply_to_id.
+    The reply is threaded onto the original (In-Reply-To and References), and
+    'to' and 'subject' default to the original sender and 'Re: <subject>'
+    unless you pass them explicitly. The original text is not quoted; include
+    any quote you want in the body.
+
     Args:
-        to: Recipient addresses, e.g. ['ann@example.com', 'Bob <bob@example.com>'].
-        subject: Subject line.
         body: Plain-text body.
+        to: Recipient addresses, e.g. ['ann@example.com', 'Bob <bob@example.com>'].
+            Required unless replying.
+        subject: Subject line. Required unless replying.
         cc: Optional Cc recipients.
         bcc: Optional Bcc recipients (not included in the headers).
+        reply_to_id: Id of the message being replied to.
+        reply_folder: Folder that message lives in (default 'INBOX').
         dry_run: When True (the default) return the rendered message without sending.
     """
     address, _ = _require_credentials()
+    if not body.strip():
+        raise ToolError("body is required.")
     to_list = _parse_recipients(to, "to")
     cc_list = _parse_recipients(cc, "cc")
     bcc_list = _parse_recipients(bcc, "bcc")
+
+    context: Optional[Dict[str, Any]] = None
+    if reply_to_id is not None:
+        uid = _parse_message_ids([reply_to_id])[0]
+        context = _reply_context(uid, reply_folder)
+        if not to_list:
+            to_list = _parse_recipients(context["reply_to"], "to")
+        if subject is None or not subject.strip():
+            subject = context["subject"]
+
     if not to_list:
         raise ToolError("At least one 'to' recipient is required.")
-    if not subject.strip():
+    if subject is None or not subject.strip():
         raise ToolError("subject is required.")
-    if not body.strip():
-        raise ToolError("body is required.")
 
     message = EmailMessage()
     message["From"] = address
@@ -569,6 +727,9 @@ def send_email(
     message["Subject"] = subject.strip()
     message["Date"] = formatdate(localtime=True)
     message["Message-ID"] = make_msgid(domain=address.rsplit("@", 1)[-1])
+    if context and context["message_id"]:
+        message["In-Reply-To"] = context["message_id"]
+        message["References"] = " ".join(context["references"])
     message.set_content(body)
 
     result: Dict[str, Any] = {
@@ -580,6 +741,8 @@ def send_email(
         "bcc": bcc_list,
         "subject": message["Subject"],
         "body": body,
+        "in_reply_to": str(message["In-Reply-To"] or ""),
+        "references": str(message["References"] or ""),
     }
     if dry_run:
         return result
