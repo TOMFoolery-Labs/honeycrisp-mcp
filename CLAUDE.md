@@ -111,6 +111,8 @@ fixtures include a card whose inline photo is deliberately undecodable, because 
 - **iCloud IMAP has no `MOVE` and no `SPECIAL-USE`** (verified 2026-09-08 with
   `scripts/smoke.py`). `_move_uids` therefore always takes the copy + `\Deleted` +
   `UID EXPUNGE` path live, and `list_folders` recognises Drafts/Junk/Archive by name.
-  `UIDPLUS` is present. Trash is `Deleted Messages`, Sent is `Sent Messages`.
+  `UIDPLUS` is present. Trash is `Deleted Messages`, Sent is `Sent Messages`. Every mail
+  write tool was verified live the same day with `scripts/roundtrip.py`; self-addressed
+  delivery took over 90 s on one run, so waits in live scripts must be generous.
 - **Notes sync over CloudKit, not IMAP.** `search_notes` reaches only legacy IMAP notes and
   is empty for most accounts; an empty result is not evidence the user has no notes.

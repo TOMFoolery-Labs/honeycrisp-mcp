@@ -143,6 +143,10 @@ Tests run fully offline against fakes in `tests/fakes.py` — no credentials, no
 account (needs `.env`) that also prints the server facts the mail tools rely on. On
 iCloud it shows no `MOVE` capability, so moves and deletes run the copy + flag +
 `UID EXPUNGE` fallback, and only Sent and Trash carry special-use flags.
+`scripts/roundtrip.py` is the live write check: it sends one tagged message to the account's
+own address, runs every mail write tool on it (mark, move, reply, delete, permanent delete)
+and removes every copy. It sends real mail, so run it deliberately. If a slow delivery trips
+it, `--resume <tag>` finishes the cleanup.
 The fixtures deliberately mirror bytes observed on a real account (CRLF line endings, empty
 `FN` with a populated `N`, an undecodable inline photo), because earlier fixtures that
 didn't hid real bugs. See `CLAUDE.md` for the architecture and the constraints behind it.
