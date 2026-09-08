@@ -15,25 +15,44 @@ CardDAV for contacts), so no private API and no Apple ID password are involved.
    ICLOUD_APP_PASSWORD=your-app-specific-password
    ```
    `.env` is gitignored. Never commit it.
-3. Install and run, either as a tool or from a checkout:
+3. Run it. Three options, from least to most setup:
    ```bash
-   uv tool install git+https://github.com/TOMFoolery-Labs/honeycrisp-mcp   # puts `honeycrisp` on PATH
-   honeycrisp
+   # No install, no venv: uv fetches, builds and caches the package on first run.
+   uvx --from git+https://github.com/TOMFoolery-Labs/honeycrisp-mcp honeycrisp
 
-   # or, from a clone
+   # Or install once and get a `honeycrisp` command on PATH.
+   uv tool install git+https://github.com/TOMFoolery-Labs/honeycrisp-mcp
+
+   # Or work from a clone.
    uv venv && uv pip install -r requirements.txt   # or: pip install -r requirements.txt
    .venv/bin/python src/server.py
    ```
 
 `.env` is resolved relative to the source file, so a checkout works no matter which
-directory a client launches it from. A tool install has no checkout, so pass the two
-variables through the client's `env` block instead. Backups go to `backups/` beside a
-checkout, or `~/.honeycrisp/backups` for a tool install; `HONEYCRISP_BACKUP_DIR` overrides
-both.
+directory a client launches it from. `uvx` and `uv tool` runs have no checkout, so pass the
+two variables through the client's `env` block instead. Backups go to `backups/` beside a
+checkout, or `~/.honeycrisp/backups` otherwise; `HONEYCRISP_BACKUP_DIR` overrides both.
 
 ### Registering with an MCP client
 
-Tool install:
+`uvx`, nothing to install (pin a commit or tag after `@` to freeze the version):
+
+```json
+{
+  "mcpServers": {
+    "honeycrisp": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/TOMFoolery-Labs/honeycrisp-mcp", "honeycrisp"],
+      "env": {
+        "ICLOUD_EMAIL": "your.email@icloud.com",
+        "ICLOUD_APP_PASSWORD": "your-app-specific-password"
+      }
+    }
+  }
+}
+```
+
+`uv tool install`:
 
 ```json
 {
