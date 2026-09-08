@@ -102,13 +102,30 @@ def calendar():
     return result
 
 
+def calendars():
+    result = server.list_calendars()
+    for c in result:
+        show(c["name"], f"kind={c['kind']} writable={c['writable']} sharing={c['sharing']!r} color={c['color']} id={c['id']}")
+    return result
+
+
+def addressbooks():
+    result = server.list_addressbooks()
+    for b in result:
+        show(b["name"], f"display_name={b['display_name']!r}")
+    return result
+
+
 def calendar_dry_runs(events):
     names = sorted({e["calendar"] for e in events})
-    show("calendars seen", names)
+    show("calendars with upcoming events", names)
     target = names[0] if names else None
     r = server.create_event(summary="(smoke test, not created)", start="2026-12-31T15:00:00-06:00", calendar=target)
     show("create_event", f"calendar={r['calendar']!r} start={r['start']} end={r['end']} created={r['created']}")
     if events and events[0]["id"]:
+        r = server.update_event(events[0]["id"], summary=events[0]["summary"] + " (smoke)")
+        show("update_event", f"changes={r['changes']} changed={r['changed']} in {r['calendar']!r}")
+        show("  before/after start", f"{r['before']['start']} / {r['after']['start']}")
         r = server.delete_event(events[0]["id"])
         show("delete_event", f"{r['summary']!r} in {r['calendar']!r} deleted={r['deleted']}")
 
@@ -144,8 +161,10 @@ def main():
         step("write tools, dry run", lambda: dry_runs(uid))
     else:
         print("   INBOX is empty; skipping message-level checks")
+    step("list_calendars", calendars)
     events = step("get_calendar_events", calendar) or []
     step("calendar write tools, dry run", lambda: calendar_dry_runs(events))
+    step("list_addressbooks", addressbooks)
     found = step("search_contacts", contacts) or []
     step("contact write tools, dry run", lambda: contact_dry_runs(found))
 

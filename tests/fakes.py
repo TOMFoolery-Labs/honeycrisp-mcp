@@ -167,16 +167,62 @@ class FakeSMTP:
 
 
 class FakeEvent:
-    def __init__(self, vobject_instance, data="", delete_error=None):
+    """An event as caldav hands it back: vobject view, raw data, and -- when
+    built from iCalendar text -- a live icalendar instance that save() serialises."""
+
+    def __init__(self, vobject_instance, data="", delete_error=None, save_error=None):
         self.vobject_instance = vobject_instance
         self.data = data
         self.delete_error = delete_error
+        self.save_error = save_error
         self.deleted = False
+        self.saved = []
+        self.icalendar_instance = None
+        if data:
+            try:
+                import icalendar
+                self.icalendar_instance = icalendar.Calendar.from_ical(data)
+            except Exception:
+                self.icalendar_instance = None
 
     def delete(self):
         if self.delete_error:
             raise self.delete_error
         self.deleted = True
+
+    def save(self, **kwargs):
+        if self.save_error:
+            raise self.save_error
+        self.data = self.icalendar_instance.to_ical().decode()
+        self.saved.append({"data": self.data, **kwargs})
+        return self
+
+
+class FakeCalClient:
+    """Answers the single PROPFIND list_calendars issues, from the calendar's `info`."""
+
+    def __init__(self, calendar):
+        self.calendar = calendar
+        self.propfinds = []
+
+    def propfind(self, url, props="", depth=0):
+        self.propfinds.append((url, depth))
+        info = self.calendar.info
+        if info is None:
+            raise Exception("PROPFIND failed")
+        comps = "".join(f'<C:comp name="{c}"/>' for c in info.get("comps", ()))
+        privs = "".join(f"<privilege><{p}/></privilege>" for p in info.get("privs", ()))
+        types = "".join(f"<{t}/>" for t in info.get("rtypes", ("collection", "calendar")))
+        color = f"<A:calendar-color>{info['color']}</A:calendar-color>" if info.get("color") else ""
+        name = f"<displayname>{xml_escape(info['display'])}</displayname>" if info.get("display") else ""
+        xml = (
+            '<multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:A="http://apple.com/ns/ical/">'
+            f"<response><href>{url}</href><propstat><prop>{name}<resourcetype>{types}</resourcetype>"
+            f"<current-user-privilege-set>{privs}</current-user-privilege-set>"
+            f"<C:supported-calendar-component-set>{comps}</C:supported-calendar-component-set>{color}"
+            "</prop></propstat></response></multistatus>"
+        )
+        return type("Resp", (), {"raw": xml})()
 
 
 class _Attr:
@@ -202,10 +248,12 @@ class FakeVObject:
 
 
 class FakeCalendar:
-    def __init__(self, name, events=(), error=None, add_error=None):
+    def __init__(self, name, events=(), error=None, add_error=None, info=None, cal_id=None):
         self.name = name
+        self.id = cal_id or name.lower()
         self.url = f"https://caldav.example.com/cal/{name}/"
-        self.client = None
+        self.info = info
+        self.client = FakeCalClient(self)
         self._events = list(events)
         self.error = error
         self.add_error = add_error
@@ -251,8 +299,9 @@ class FakeDAVClient:
         return FakePrincipal(self._calendars)
 
 
-def make_event(summary, dtstart, dtend=None, uid=None, data="", delete_error=None):
-    return FakeEvent(FakeVObject(FakeVEvent(summary, dtstart, dtend, uid)), data=data, delete_error=delete_error)
+def make_event(summary, dtstart, dtend=None, uid=None, data="", delete_error=None, save_error=None):
+    return FakeEvent(FakeVObject(FakeVEvent(summary, dtstart, dtend, uid)), data=data,
+                     delete_error=delete_error, save_error=save_error)
 
 
 # --- CardDAV canned responses (Apple returns ABSOLUTE hrefs on partition hosts)
@@ -270,11 +319,12 @@ HOME_XML = (
 )
 
 
-def collections_xml(*names):
+def collections_xml(*names, display_names=None):
+    display_names = display_names or {}
     entries = "".join(
         "<response><href>https://p61-contacts.icloud.com:443/123456/carddavhome/%s/</href>"
-        "<propstat><prop><resourcetype><collection/><card:addressbook/></resourcetype></prop></propstat>"
-        "</response>" % name
+        "<propstat><prop><resourcetype><collection/><card:addressbook/></resourcetype>%s</prop></propstat>"
+        "</response>" % (name, f"<displayname>{xml_escape(display_names[name])}</displayname>" if name in display_names else "")
         for name in names
     )
     # A non-addressbook collection that must be ignored.

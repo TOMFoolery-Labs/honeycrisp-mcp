@@ -71,7 +71,9 @@ Checkout:
 | `list_folders()` | Every mail folder with its role (inbox, sent, trash, ...) and message and unseen counts. |
 | `search_emails(query, folder, limit)` | Search a mail folder with an IMAP query. Returns sender, subject, date and a decoded body preview, newest first. |
 | `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
+| `list_calendars()` | Every calendar with its kind (events or reminders), writability, sharing and colour. |
 | `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. Each carries an `id` for `delete_event`. |
+| `list_addressbooks()` | Every address book, for `create_contact`. |
 | `search_contacts(query, limit)` | Search all address books. Returns id, name, organization, and every email and phone per contact. |
 | `search_notes(query, limit)` | Legacy IMAP notes only — see the caveat below. |
 
@@ -84,6 +86,7 @@ Checkout:
 | `delete_emails(message_ids, folder, permanent, dry_run)` | Move messages to Trash, or expunge them outright with `permanent=True`. |
 | `send_email(body, to, subject, cc, bcc, reply_to_id, reply_folder, dry_run)` | Send a plain-text email over SMTP and file a copy in Sent. Pass `reply_to_id` to reply in-thread. |
 | `create_event(summary, start, end, calendar, all_day, location, description, dry_run)` | Create a timed or all-day event. |
+| `update_event(event_id, calendar, summary, start, end, location, description, dry_run)` | Change an event's title, time, location or notes; everything else is preserved. |
 | `delete_event(event_id, calendar, dry_run)` | Delete an event (every occurrence of a recurring one), backing up its iCalendar text first. |
 | `create_contact(name, phones, emails, organization, addressbook, dry_run)` | Create a contact. |
 | `update_contact(contact_id, name, phones, emails, dry_run)` | Edit one contact. |
@@ -117,8 +120,14 @@ Calendar:
 - **Explicit targets.** `create_event` needs `calendar=` when the account has more than one,
   rather than guessing. Naive times are treated as UTC, so pass an offset for local times.
   All-day events take dates, with `end` being the day after the last day.
-- **Backups.** `delete_event` saves the event's iCalendar text to `backups/` before removing
-  it. Deleting a recurring event removes every occurrence.
+- **Edits preserve the rest.** `update_event` changes only the fields you pass; alarms,
+  attendees, recurrence rules, time zones and custom properties survive. Passing `start`
+  alone moves the event and keeps its duration. For a recurring event the change applies to
+  the series. The save carries an `If-Match` ETag, so a concurrent edit is refused.
+- **Backups.** `update_event` and `delete_event` save the event's iCalendar text to
+  `backups/` before touching it. Deleting a recurring event removes every occurrence.
+- **Reminders lists look like calendars.** iCloud exposes them over CalDAV too; they are the
+  entries `list_calendars` reports as `kind: reminders`, and cannot hold events.
 
 Contacts:
 

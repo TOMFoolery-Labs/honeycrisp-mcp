@@ -20,7 +20,7 @@ Live checks against the real account require `.env` (`ICLOUD_EMAIL`, `ICLOUD_APP
 
 ## Architecture
 
-One module, `src/server.py`, exposing sixteen FastMCP tools over four protocols: IMAP for mail
+One module, `src/server.py`, exposing nineteen FastMCP tools over four protocols: IMAP for mail
 and legacy notes, SMTP (stdlib `smtplib`, STARTTLS on 587) for sending, CalDAV (via the
 `caldav` lib) for calendar, and raw CardDAV over `requests` for contacts. `tests/fakes.py`
 provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` for fakes.
@@ -124,6 +124,16 @@ fixtures include a card whose inline photo is deliberately undecodable, because 
 - **iCloud CalDAV rejects the by-UID `calendar-query` REPORT with 412** but serves every
   event at `<calendar>/<UID>.ics`. `_event_by_uid` does the direct GET first and keeps the
   REPORT only as a fallback. Verified 2026-09-08.
+- **Reminders lists are CalDAV calendars** whose `supported-calendar-component-set` is
+  `VTODO` only. On this account they are the ones with ⚠️ in the name. `list_calendars`
+  reads that property (plus privileges, resourcetype and Apple's `calendar-color`) with one
+  raw PROPFIND per calendar, because the `caldav` lib has no element for the privilege set.
+- **`update_event` edits through `event.icalendar_instance`**, never by re-serialising
+  from vobject. Reading `event.data` first captures the raw bytes for the backup; touching
+  the icalendar instance afterwards clears the cached raw data so `save()` serialises the
+  edit. `save(only_this_recurrence=False)` is deliberate: we hold the whole `.ics`, and the
+  default would try to merge into a master. `load()` records the ETag, so the PUT carries
+  `If-Match` and a 412 surfaces as `ETagMismatchError`.
 - **iCloud CardDAV intermittently returns an empty 401** to a correctly authenticated
   discovery PROPFIND (seen on the principal URL, clearing within seconds). It also varies
   between absolute partition-host hrefs and relative ones. `_carddav_propfind` retries a

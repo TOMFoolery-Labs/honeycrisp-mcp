@@ -31,7 +31,7 @@ from urllib.parse import urljoin
 from xml.sax.saxutils import escape as xml_escape
 
 import caldav
-from caldav.lib.error import NotFoundError
+from caldav.lib.error import ETagMismatchError, NotFoundError
 import imapclient
 from imapclient.imapclient import SENT as SENT_FLAG, TRASH as TRASH_FLAG
 import requests
@@ -1092,8 +1092,11 @@ def _ical_fold(line: str) -> str:
 
 def _parse_event_time(value: str, field: str, all_day: bool) -> Any:
     if all_day:
+        text = value.strip()
         try:
-            return date.fromisoformat(value.strip()[:10])
+            if len(text) != 10:
+                raise ValueError("not a bare date")
+            return date.fromisoformat(text)
         except ValueError as e:
             raise ToolError(f"{field} must be a date (YYYY-MM-DD) for an all-day event, got {value!r}.") from e
     return _parse_iso(value, field)
@@ -1156,6 +1159,233 @@ def _event_by_uid(calendar: Any, uid: str) -> Optional[Any]:
         return calendar.get_event_by_uid(uid)
     except NotFoundError:
         return None
+
+
+_CALENDAR_PROPFIND = (
+    '<?xml version="1.0" encoding="utf-8" ?>'
+    '<propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:A="http://apple.com/ns/ical/">'
+    '<prop><displayname/><resourcetype/><current-user-privilege-set/>'
+    '<C:supported-calendar-component-set/><A:calendar-color/></prop></propfind>'
+)
+
+
+def _calendar_info(calendar: Any) -> Dict[str, Any]:
+    """Describe one calendar collection from a single PROPFIND.
+
+    iCloud exposes Reminders lists as calendars too; they differ only in
+    supporting VTODO instead of VEVENT, so the component set is what tells
+    a model where events can go.
+    """
+    entry: Dict[str, Any] = {
+        "name": calendar.name, "id": str(calendar.id or ""), "kind": "unknown",
+        "writable": None, "sharing": "", "color": "",
+    }
+    try:
+        response = calendar.client.propfind(str(calendar.url), props=_CALENDAR_PROPFIND, depth=0)
+        raw = response.raw if isinstance(response.raw, str) else response.raw.decode("utf-8")
+        root = ET.fromstring(raw)
+    except Exception as e:
+        log.warning("PROPFIND failed for calendar %r: %s", calendar.name, e)
+        return entry
+
+    comps = {e.get("name") for e in root.iter("{urn:ietf:params:xml:ns:caldav}comp")}
+    privileges = {e.tag.split("}")[-1] for p in root.iter("{DAV:}privilege") for e in p}
+    rtype = root.find(".//{DAV:}resourcetype")
+    types = {e.tag.split("}")[-1] for e in rtype} if rtype is not None else set()
+    color = root.find(".//{http://apple.com/ns/ical/}calendar-color")
+    display = root.find(".//{DAV:}displayname")
+
+    if display is not None and display.text:
+        entry["name"] = display.text
+    entry["kind"] = ("events" if "VEVENT" in comps else "reminders" if "VTODO" in comps
+                     else "other" if comps else "unknown")
+    if privileges:
+        entry["writable"] = "write-content" in privileges or "write" in privileges
+    entry["sharing"] = ("owner" if "shared-owner" in types else "shared-with-me" if "shared" in types else "")
+    entry["color"] = (color.text or "").strip() if color is not None else ""
+    return entry
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def list_calendars() -> List[Dict[str, Any]]:
+    """
+    List every calendar with its kind, writability, sharing and colour.
+
+    Use the 'name' as the 'calendar' argument to create_event and friends.
+    'kind' is 'events' for a normal calendar or 'reminders' for a Reminders
+    list (which CalDAV exposes the same way but cannot hold events).
+    """
+    return [_calendar_info(c) for c in _calendars()]
+
+
+def _find_event(calendars: List[Any], uid: str) -> Tuple[Any, Any]:
+    failures = []
+    for cal in calendars:
+        try:
+            event = _event_by_uid(cal, uid)
+        except Exception as e:
+            failures.append(f"{cal.name!r}: {e}")
+            log.warning("Lookup failed in calendar %r: %s", cal.name, e)
+            continue
+        if event is not None:
+            return cal, event
+    hint = f" Lookup failed in {', '.join(failures)}." if failures else ""
+    raise ToolError(f"No event found with id {uid!r}.{hint}")
+
+
+def _master_component(event: Any) -> Any:
+    """The VEVENT that defines the series, not a single recurrence override."""
+    instance = event.icalendar_instance
+    if instance is None:
+        raise ToolError("The event could not be parsed.")
+    components = list(instance.walk("VEVENT"))
+    if not components:
+        raise ToolError("The object holds no VEVENT.")
+    return next((c for c in components if "RECURRENCE-ID" not in c), components[0])
+
+
+def _component_times(comp: Any) -> Tuple[Any, Any, bool]:
+    start = comp.decoded("DTSTART")
+    all_day = isinstance(start, date) and not isinstance(start, datetime)
+    if "DTEND" in comp:
+        end = comp.decoded("DTEND")
+    elif "DURATION" in comp:
+        end = start + comp.decoded("DURATION")
+    else:
+        end = start + (timedelta(days=1) if all_day else timedelta(0))
+    return start, end, all_day
+
+
+def _component_summary(comp: Any) -> Dict[str, Any]:
+    start, end, all_day = _component_times(comp)
+    return {
+        "summary": str(comp.get("SUMMARY", "")),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "all_day": all_day,
+        "location": str(comp.get("LOCATION", "")),
+        "description": str(comp.get("DESCRIPTION", "")),
+    }
+
+
+def _set_time(comp: Any, prop: str, value: Any) -> None:
+    comp.pop(prop, None)
+    if isinstance(value, datetime):
+        value = value.astimezone(timezone.utc)
+    comp.add(prop, value)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
+def update_event(
+    event_id: str,
+    calendar: Optional[str] = None,
+    summary: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    location: Optional[str] = None,
+    description: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Change an existing event's title, time, location or notes. Preview first.
+
+    Only the fields you pass are touched; alarms, attendees, recurrence
+    rules and anything else on the event are preserved. Passing 'start'
+    alone moves the event and keeps its duration. For a recurring event the
+    change applies to the whole series. Pass an empty string for location
+    or description to remove it.
+
+    Times follow create_event: ISO 8601, naive values treated as UTC, and
+    dates (YYYY-MM-DD) for an all-day event.
+
+    Args:
+        event_id: The 'id' from get_calendar_events.
+        calendar: Calendar name, to skip searching the others.
+        summary: New title.
+        start: New start.
+        end: New end.
+        location: New location ('' removes it).
+        description: New notes ('' removes them).
+        dry_run: When True (the default) report the change without saving.
+    """
+    if all(v is None for v in (summary, start, end, location, description)):
+        raise ToolError("Nothing to update: pass at least one of summary, start, end, location or description.")
+    if summary is not None and not summary.strip():
+        raise ToolError("summary cannot be empty.")
+    uid = event_id.strip()
+    if not uid:
+        raise ToolError("event_id is required; use the 'id' field from get_calendar_events.")
+
+    calendars = _calendars()
+    if calendar:
+        calendars = [_pick_calendar(calendars, calendar)]
+    cal, event = _find_event(calendars, uid)
+    original = str(event.data or "")
+    comp = _master_component(event)
+    before = _component_summary(comp)
+    old_start, old_end, all_day = _component_times(comp)
+
+    changes = []
+    if summary is not None and summary.strip() != before["summary"]:
+        comp["SUMMARY"] = summary.strip()
+        changes.append(f"summary: {before['summary']!r} -> {summary.strip()!r}")
+
+    new_start = _parse_event_time(start, "start", all_day) if start else old_start
+    if end:
+        new_end = _parse_event_time(end, "end", all_day)
+    elif start:
+        new_end = new_start + (old_end - old_start)
+    else:
+        new_end = old_end
+    if new_end <= new_start:
+        raise ToolError(f"end ({new_end.isoformat()}) must be after start ({new_start.isoformat()}).")
+    if new_start != old_start:
+        _set_time(comp, "DTSTART", new_start)
+        changes.append(f"start: {old_start.isoformat()} -> {new_start.isoformat()}")
+    if new_end != old_end or (start and "DURATION" in comp):
+        comp.pop("DURATION", None)
+        _set_time(comp, "DTEND", new_end)
+        if new_end != old_end:
+            changes.append(f"end: {old_end.isoformat()} -> {new_end.isoformat()}")
+
+    for prop, value in (("LOCATION", location), ("DESCRIPTION", description)):
+        if value is None:
+            continue
+        current = str(comp.get(prop, ""))
+        if value.strip() == current:
+            continue
+        comp.pop(prop, None)
+        if value.strip():
+            comp.add(prop, value.strip())
+        changes.append(f"{prop.lower()}: {current!r} -> {value.strip()!r}")
+
+    if not changes:
+        return {"dry_run": dry_run, "changed": False, "id": uid, "calendar": cal.name,
+                "changes": [], "before": before, "after": before}
+
+    backup_path = None
+    if not dry_run:
+        backup_path = _backup_text("event", "ics", original)
+        try:
+            event.save(only_this_recurrence=False)
+        except ETagMismatchError as e:
+            raise ToolError(
+                f"Event {uid!r} changed on the server since it was read; nothing was written. "
+                "Re-run to pick up the current version."
+            ) from e
+        except Exception as e:
+            raise ToolError(f"Saving the event to {cal.name!r} failed: {e}") from e
+
+    return {
+        "dry_run": dry_run,
+        "changed": not dry_run,
+        "id": uid,
+        "calendar": cal.name,
+        "backup": backup_path,
+        "changes": changes,
+        "before": before,
+        "after": _component_summary(comp),
+    }
 
 
 def _event_summary(event: Any) -> Dict[str, Any]:
@@ -1257,22 +1487,7 @@ def delete_event(event_id: str, calendar: Optional[str] = None, dry_run: bool = 
     calendars = _calendars()
     if calendar:
         calendars = [_pick_calendar(calendars, calendar)]
-
-    found, failures = None, []
-    for cal in calendars:
-        try:
-            event = _event_by_uid(cal, uid)
-        except Exception as e:
-            failures.append(f"{cal.name!r}: {e}")
-            log.warning("Lookup failed in calendar %r: %s", cal.name, e)
-            continue
-        if event is not None:
-            found = (cal, event)
-            break
-    if found is None:
-        hint = f" Lookup failed in {', '.join(failures)}." if failures else ""
-        raise ToolError(f"No event found with id {uid!r}.{hint}")
-    cal, event = found
+    cal, event = _find_event(calendars, uid)
 
     backup_path = None
     if not dry_run:
@@ -1434,7 +1649,11 @@ class Card(NamedTuple):
 
 
 def _addressbook_urls(auth: HTTPBasicAuth) -> List[str]:
-    """Discover every address book collection.
+    return [book["url"] for book in _addressbooks(auth)]
+
+
+def _addressbooks(auth: HTTPBasicAuth) -> List[Dict[str, str]]:
+    """Discover every address book collection, with its display name.
 
     Apple redirects to partition hosts (e.g. p61-contacts.icloud.com) and
     returns absolute hrefs, so every href must be resolved with urljoin --
@@ -1462,10 +1681,10 @@ def _addressbook_urls(auth: HTTPBasicAuth) -> List[str]:
 
     collections = _carddav_propfind(
         home_url, 1,
-        '<?xml version="1.0" encoding="utf-8" ?><propfind xmlns="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><prop><resourcetype/></prop></propfind>',
+        '<?xml version="1.0" encoding="utf-8" ?><propfind xmlns="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><prop><resourcetype/><displayname/></prop></propfind>',
         auth,
     )
-    urls = []
+    books = []
     for response in collections.findall('{DAV:}response'):
         resourcetype = response.find('.//{DAV:}resourcetype')
         if resourcetype is None:
@@ -1473,9 +1692,33 @@ def _addressbook_urls(auth: HTTPBasicAuth) -> List[str]:
         if resourcetype.find('{urn:ietf:params:xml:ns:carddav}addressbook') is None:
             continue
         href = response.find('{DAV:}href')
-        if href is not None and href.text:
-            urls.append(urljoin(home_url, href.text))
-    return urls
+        if href is None or not href.text:
+            continue
+        url = urljoin(home_url, href.text)
+        display = response.find('.//{DAV:}displayname')
+        books.append({
+            "name": url.rstrip("/").rsplit("/", 1)[-1],
+            "display_name": (display.text or "").strip() if display is not None else "",
+            "url": url,
+        })
+    return books
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def list_addressbooks() -> List[Dict[str, str]]:
+    """
+    List every address book. Use 'name' as the 'addressbook' argument to create_contact.
+    """
+    address, password = _require_credentials()
+    auth = HTTPBasicAuth(address, password)
+    try:
+        return [{"name": b["name"], "display_name": b["display_name"]} for b in _addressbooks(auth)]
+    except ToolError:
+        raise
+    except requests.RequestException as e:
+        raise ToolError(f"CardDAV request failed: {e}") from e
+    except ET.ParseError as e:
+        raise ToolError(f"CardDAV returned malformed XML: {e}") from e
 
 
 def _fetch_cards(auth: HTTPBasicAuth, query: str = "") -> List[Card]:
