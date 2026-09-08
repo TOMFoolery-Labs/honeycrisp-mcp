@@ -3,8 +3,8 @@
 A Model Context Protocol (MCP) server for iCloud — Mail, Calendar, Contacts and Notes —
 using an Apple app-specific password.
 
-It talks to the open protocols Apple supports (IMAP for mail, CalDAV for calendar, CardDAV
-for contacts), so no private API and no Apple ID password are involved.
+It talks to the open protocols Apple supports (IMAP and SMTP for mail, CalDAV for calendar,
+CardDAV for contacts), so no private API and no Apple ID password are involved.
 
 ## Setup
 
@@ -52,11 +52,28 @@ directory a client launches it from.
 
 | Tool | Description |
 | --- | --- |
+| `delete_emails(message_ids, folder, permanent, dry_run)` | Move messages to Trash, or expunge them outright with `permanent=True`. |
+| `send_email(to, subject, body, cc, bcc, dry_run)` | Send a plain-text email over SMTP and file a copy in Sent. |
 | `update_contact(contact_id, name, phones, emails, dry_run)` | Edit one contact. |
 | `repair_contacts(dry_run, limit, contact_ids)` | Fix systematic contact data defects in bulk or for a chosen subset. |
 
-Both write tools default to `dry_run=True`: they report exactly what would change and send
+Every write tool defaults to `dry_run=True`: it reports exactly what would change and sends
 nothing. Pass `dry_run=False` to apply.
+
+Mail:
+
+- **Trash first.** `delete_emails` moves messages to the account's Trash folder (`Deleted
+  Messages` on iCloud) with a single IMAP `MOVE`, so they stay recoverable. Deleting from
+  Trash itself requires `permanent=True`.
+- **Permanent deletes are backed up.** With `permanent=True` each message is saved in full to
+  `backups/mail-<timestamp>/` as an `.eml` file before it is expunged. Only the requested UIDs
+  are expunged (`UID EXPUNGE`), never every `\Deleted` message in the folder.
+- **All-or-nothing ids.** Ids are per-folder. If any id is not found, nothing is deleted.
+- **Sent mail is filed.** iCloud's SMTP server does not save outgoing mail, so `send_email`
+  appends a copy to the Sent folder after delivery, the same way Mail.app does. If that step
+  fails the message has still gone out; the result says `saved_to_sent: false`.
+
+Contacts:
 
 - **Surgical edits.** Only changed lines are rewritten; every other line — photos, custom
   properties, folded continuations — is preserved byte for byte.

@@ -14,18 +14,22 @@ import email.policy
 import logging
 import os
 import re
+import smtplib
 import sys
 import threading
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from email.header import decode_header, make_header
+from email.message import EmailMessage
+from email.utils import formatdate, getaddresses, make_msgid
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
 from urllib.parse import urljoin
 from xml.sax.saxutils import escape as xml_escape
 
 import caldav
 import imapclient
+from imapclient.imapclient import SENT as SENT_FLAG, TRASH as TRASH_FLAG
 import requests
 import vobject
 from dotenv import load_dotenv
@@ -49,6 +53,8 @@ ICLOUD_EMAIL = os.getenv("ICLOUD_EMAIL")
 ICLOUD_APP_PASSWORD = os.getenv("ICLOUD_APP_PASSWORD")
 
 IMAP_HOST = "imap.mail.me.com"
+SMTP_HOST = "smtp.mail.me.com"
+SMTP_PORT = 587  # STARTTLS
 CALDAV_URL = "https://caldav.icloud.com/"
 CARDDAV_URL = "https://contacts.icloud.com"
 
@@ -65,7 +71,8 @@ PREVIEW_CHARS = 500
 # against iCloud pulls down every event in every calendar.
 DEFAULT_CALENDAR_WINDOW = timedelta(days=90)
 
-# Pre-change copies of any card the server writes are saved here.
+# Pre-change copies of any card the server writes, and full copies of any
+# message it deletes permanently, are saved here.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "backups")
 
@@ -157,6 +164,32 @@ def _close_imap_at_exit() -> None:
     global _imap_client
     _quiet_close(_imap_client)
     _imap_client = None
+
+
+def _connect_smtp() -> smtplib.SMTP:
+    """Open an authenticated SMTP session. Not cached: SMTP sessions are short."""
+    address, password = _require_credentials()
+    try:
+        client = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=HTTP_TIMEOUT)
+    except OSError as e:
+        raise ToolError(f"Could not reach {SMTP_HOST}:{SMTP_PORT}: {e}") from e
+    try:
+        client.starttls()
+        client.login(address, password)
+    except Exception as e:
+        _quiet_quit(client)
+        raise ToolError(
+            f"iCloud SMTP login failed: {e}. Confirm ICLOUD_EMAIL and that "
+            "ICLOUD_APP_PASSWORD is a valid app-specific password."
+        ) from e
+    return client
+
+
+def _quiet_quit(client: smtplib.SMTP) -> None:
+    try:
+        client.quit()
+    except Exception as e:
+        log.debug("Could not close SMTP connection cleanly: %s", e)
 
 
 def get_caldav_client() -> caldav.DAVClient:
@@ -261,6 +294,83 @@ def _fetch_body_bytes(data: Dict[bytes, Any]) -> bytes:
     return b""
 
 
+def _parse_message_ids(message_ids: List[str]) -> List[int]:
+    """Validate the ids handed back by search_emails (IMAP UIDs as strings)."""
+    if not message_ids:
+        # An empty list must never widen to "every message in the folder".
+        raise ToolError("message_ids is empty; pass the 'id' values from search_emails.")
+    uids: List[int] = []
+    for raw in message_ids:
+        text = str(raw).strip()
+        if not text.isdigit():
+            raise ToolError(f"Invalid message id {raw!r}; use the 'id' field from search_emails.")
+        uids.append(int(text))
+    return sorted(set(uids))
+
+
+def _describe_messages(client: imapclient.IMAPClient, uids: List[int], folder: str) -> List[Dict[str, str]]:
+    """Fetch envelopes for the given UIDs, refusing to proceed if any is missing.
+
+    UIDs are per-folder, so a stale or mis-foldered id must fail loudly rather
+    than have the remaining ids acted on as if the request were complete.
+    """
+    fetched = client.fetch(uids, ["ENVELOPE"])
+    missing = [u for u in uids if not fetched.get(u, {}).get(b"ENVELOPE")]
+    if missing:
+        raise ToolError(
+            f"No message with id {', '.join(map(str, missing))} in folder {folder!r}. "
+            "Ids are specific to a folder; re-run search_emails with the same folder."
+        )
+    described = []
+    for uid in uids:
+        envelope = fetched[uid][b"ENVELOPE"]
+        described.append({
+            "id": str(uid),
+            "from": _format_address(envelope.from_),
+            "subject": _decode_header_value(envelope.subject),
+            "date": envelope.date.isoformat() if envelope.date else "",
+        })
+    return described
+
+
+def _special_folder(client: imapclient.IMAPClient, flag: bytes) -> Optional[str]:
+    try:
+        return client.find_special_folder(flag)
+    except Exception as e:
+        log.debug("Special folder lookup for %r failed: %s", flag, e)
+        return None
+
+
+def _backup_messages(folder: str, raw_by_uid: Dict[int, bytes]) -> str:
+    """Save full copies of messages about to be permanently deleted."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_folder = re.sub(r"[^A-Za-z0-9._-]+", "_", folder) or "folder"
+    directory = os.path.join(BACKUP_DIR, f"mail-{stamp}")
+    os.makedirs(directory, exist_ok=True)
+    for uid, raw in raw_by_uid.items():
+        with open(os.path.join(directory, f"{safe_folder}-{uid}.eml"), "wb") as handle:
+            handle.write(raw)
+    return directory
+
+
+def _parse_recipients(values: Optional[List[str]], field: str) -> List[str]:
+    """Normalise a list of recipients, rejecting anything without a usable address."""
+    if not values:
+        return []
+    recipients = []
+    for raw in values:
+        text = str(raw).strip()
+        if not text:
+            continue
+        parsed = getaddresses([text])
+        name, addr = parsed[0] if len(parsed) == 1 else ("", "")
+        local, _, domain = addr.rpartition("@")
+        if not local or "." not in domain or any(c.isspace() for c in addr):
+            raise ToolError(f"Invalid {field} address {raw!r}.")
+        recipients.append(f"{name} <{addr}>" if name else addr)
+    return recipients
+
+
 # --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
@@ -325,6 +435,180 @@ def search_emails(query: str = "ALL", folder: str = "INBOX", limit: int = 10) ->
             })
 
         return results
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False})
+def delete_emails(
+    message_ids: List[str],
+    folder: str = "INBOX",
+    permanent: bool = False,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Delete emails from a folder. Modifies the live mailbox -- preview first.
+
+    By default messages are moved to the account's Trash folder, from which
+    they can be recovered. With permanent=True they are flagged \\Deleted and
+    expunged instead; a full copy of each is saved under backups/ first.
+
+    Args:
+        message_ids: The 'id' values from search_emails. Ids are specific to
+            the folder they were found in.
+        folder: The folder the messages live in (default 'INBOX').
+        permanent: Expunge outright instead of moving to Trash. Required to
+            delete messages that are already in Trash.
+        dry_run: When True (the default) report what would be deleted without
+            touching anything.
+    """
+    uids = _parse_message_ids(message_ids)
+
+    with imap_session() as client:
+        try:
+            client.select_folder(folder, readonly=dry_run)
+        except Exception as e:
+            raise ToolError(f"Could not open folder {folder!r}: {e}") from e
+
+        messages = _describe_messages(client, uids, folder)
+
+        trash = _special_folder(client, TRASH_FLAG)
+        if permanent:
+            action, destination = "delete_permanently", None
+        else:
+            if trash is None:
+                raise ToolError(
+                    "Could not locate the Trash folder on this account. Pass "
+                    "permanent=True to delete outright."
+                )
+            if trash == folder:
+                raise ToolError(
+                    f"Messages in {folder!r} are already in Trash; pass permanent=True "
+                    "to delete them outright."
+                )
+            action, destination = "move_to_trash", trash
+
+        backup_path = None
+        if not dry_run:
+            if permanent:
+                fetched = client.fetch(uids, ["BODY.PEEK[]"])
+                backup_path = _backup_messages(
+                    folder, {uid: _fetch_body_bytes(fetched.get(uid, {})) for uid in uids})
+                client.delete_messages(uids)
+                _expunge(client, uids)
+            elif client.has_capability("MOVE"):
+                client.move(uids, destination)
+            else:
+                client.copy(uids, destination)
+                client.delete_messages(uids)
+                _expunge(client, uids)
+
+    return {
+        "dry_run": dry_run,
+        "deleted": not dry_run,
+        "action": action,
+        "folder": folder,
+        "destination": destination,
+        "backup": backup_path,
+        "messages": messages,
+    }
+
+
+def _expunge(client: imapclient.IMAPClient, uids: List[int]) -> None:
+    """Expunge only the given UIDs where the server allows it.
+
+    A plain EXPUNGE removes every message in the folder carrying \\Deleted,
+    including ones flagged by other clients, so it is used only as a fallback.
+    """
+    if client.has_capability("UIDPLUS"):
+        client.uid_expunge(uids)
+    else:
+        log.warning("Server lacks UIDPLUS; expunging all \\Deleted messages in the folder.")
+        client.expunge()
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+def send_email(
+    to: List[str],
+    subject: str,
+    body: str,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Send a plain-text email from the iCloud account. Preview first.
+
+    The message goes out over SMTP and a copy is then filed in the account's
+    Sent folder so it appears in Mail on every device. Sending cannot be
+    undone, so the default is a dry run that renders the message without
+    sending it.
+
+    Args:
+        to: Recipient addresses, e.g. ['ann@example.com', 'Bob <bob@example.com>'].
+        subject: Subject line.
+        body: Plain-text body.
+        cc: Optional Cc recipients.
+        bcc: Optional Bcc recipients (not included in the headers).
+        dry_run: When True (the default) return the rendered message without sending.
+    """
+    address, _ = _require_credentials()
+    to_list = _parse_recipients(to, "to")
+    cc_list = _parse_recipients(cc, "cc")
+    bcc_list = _parse_recipients(bcc, "bcc")
+    if not to_list:
+        raise ToolError("At least one 'to' recipient is required.")
+    if not subject.strip():
+        raise ToolError("subject is required.")
+    if not body.strip():
+        raise ToolError("body is required.")
+
+    message = EmailMessage()
+    message["From"] = address
+    message["To"] = ", ".join(to_list)
+    if cc_list:
+        message["Cc"] = ", ".join(cc_list)
+    message["Subject"] = subject.strip()
+    message["Date"] = formatdate(localtime=True)
+    message["Message-ID"] = make_msgid(domain=address.rsplit("@", 1)[-1])
+    message.set_content(body)
+
+    result: Dict[str, Any] = {
+        "dry_run": dry_run,
+        "sent": False,
+        "from": address,
+        "to": to_list,
+        "cc": cc_list,
+        "bcc": bcc_list,
+        "subject": message["Subject"],
+        "body": body,
+    }
+    if dry_run:
+        return result
+
+    recipients = to_list + cc_list + bcc_list
+    smtp = _connect_smtp()
+    try:
+        smtp.send_message(message, from_addr=address, to_addrs=recipients)
+    except smtplib.SMTPException as e:
+        raise ToolError(f"SMTP rejected the message: {e}") from e
+    finally:
+        _quiet_quit(smtp)
+    result["sent"] = True
+
+    # iCloud's SMTP does not file outgoing mail; clients APPEND it themselves.
+    # The message has already left, so a failure here is reported, not raised.
+    result["saved_to_sent"] = False
+    try:
+        with imap_session() as client:
+            sent_folder = _special_folder(client, SENT_FLAG)
+            if sent_folder is None:
+                log.warning("Could not locate the Sent folder; message not filed.")
+            else:
+                wire = message.as_bytes(policy=message.policy.clone(linesep="\r\n"))
+                client.append(sent_folder, wire, flags=[imapclient.SEEN])
+                result["saved_to_sent"] = True
+    except Exception as e:
+        log.warning("Message sent but could not be filed in Sent: %s", e)
+    return result
 
 
 def _parse_iso(value: str, field: str) -> datetime:

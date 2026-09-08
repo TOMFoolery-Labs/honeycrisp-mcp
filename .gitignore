@@ -1,7 +1,8 @@
 # Credentials -- never commit the app-specific password
 .env
 
-# Pre-change copies of contacts written by repair_contacts/update_contact
+# Pre-change copies of contacts written by repair_contacts/update_contact,
+# and full copies of messages removed by delete_emails(permanent=True)
 backups/
 
 .venv/

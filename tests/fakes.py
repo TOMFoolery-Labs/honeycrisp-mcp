@@ -22,10 +22,15 @@ class Envelope:
 class FakeIMAP:
     """Records the commands issued so tests can assert on protocol usage."""
 
-    def __init__(self, uids=None, messages=None, folders=("INBOX",)):
+    def __init__(self, uids=None, messages=None, folders=("INBOX",),
+                 special=None, capabilities=("MOVE", "UIDPLUS")):
         self.uids = list(uids or [])
         self.messages = messages or {}
         self.folders = set(folders)
+        # Maps imapclient special-folder flags (b"\\Trash", b"\\Sent") to names,
+        # the way find_special_folder resolves them on a real server.
+        self.special = dict(special or {})
+        self.capabilities = set(capabilities)
         self.calls = []
         self.selected = None
         self.readonly = None
@@ -33,6 +38,11 @@ class FakeIMAP:
         self.noop_fails = False
         self.search_error = None
         self.fetch_error = None
+        self.moved = []
+        self.copied = []
+        self.flagged_deleted = []
+        self.expunged = []
+        self.appended = []
 
     def noop(self):
         self.calls.append("noop")
@@ -57,6 +67,48 @@ class FakeIMAP:
             raise self.fetch_error
         return {uid: self.messages[uid] for uid in uids if uid in self.messages}
 
+    def has_capability(self, capability):
+        return capability in self.capabilities
+
+    def find_special_folder(self, flag):
+        self.calls.append(("find_special_folder", flag))
+        return self.special.get(flag)
+
+    def move(self, uids, folder):
+        assert "MOVE" in self.capabilities, "MOVE issued without the capability"
+        self.calls.append(("move", tuple(uids), folder))
+        self.moved.append((tuple(uids), folder))
+        self._remove(uids)
+
+    def copy(self, uids, folder):
+        self.calls.append(("copy", tuple(uids), folder))
+        self.copied.append((tuple(uids), folder))
+
+    def delete_messages(self, uids, silent=False):
+        self.calls.append(("delete_messages", tuple(uids)))
+        self.flagged_deleted.extend(uids)
+
+    def uid_expunge(self, uids):
+        assert "UIDPLUS" in self.capabilities, "UID EXPUNGE issued without UIDPLUS"
+        self.calls.append(("uid_expunge", tuple(uids)))
+        self.expunged.extend(uids)
+        self._remove(uids)
+
+    def expunge(self, uids=None):
+        self.calls.append(("expunge", None))
+        self.expunged.extend(self.flagged_deleted)
+        self._remove(self.flagged_deleted)
+
+    def append(self, folder, msg, flags=(), msg_time=None):
+        self.calls.append(("append", folder, tuple(flags)))
+        self.appended.append((folder, msg, tuple(flags)))
+
+    def _remove(self, uids):
+        for uid in uids:
+            if uid in self.uids:
+                self.uids.remove(uid)
+            self.messages.pop(uid, None)
+
     def logout(self):
         self.calls.append("logout")
         self.logged_out = True
@@ -64,6 +116,24 @@ class FakeIMAP:
     def shutdown(self):
         self.calls.append("shutdown")
         self.logged_out = True
+
+
+class FakeSMTP:
+    """Records what would have gone out over SMTP."""
+
+    def __init__(self, error=None):
+        self.sent = []
+        self.error = error
+        self.quit_called = False
+
+    def send_message(self, msg, from_addr=None, to_addrs=None):
+        if self.error:
+            raise self.error
+        self.sent.append({"message": msg, "from": from_addr, "to": list(to_addrs or [])})
+        return {}
+
+    def quit(self):
+        self.quit_called = True
 
 
 class FakeEvent:

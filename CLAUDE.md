@@ -20,9 +20,10 @@ Live checks against the real account require `.env` (`ICLOUD_EMAIL`, `ICLOUD_APP
 
 ## Architecture
 
-One module, `src/server.py`, exposing six FastMCP tools over three protocols: IMAP for mail
-and legacy notes, CalDAV (via the `caldav` lib) for calendar, and raw CardDAV over `requests`
-for contacts. `tests/fakes.py` provides stand-ins for all three.
+One module, `src/server.py`, exposing eight FastMCP tools over four protocols: IMAP for mail
+and legacy notes, SMTP (stdlib `smtplib`, STARTTLS on 587) for sending, CalDAV (via the
+`caldav` lib) for calendar, and raw CardDAV over `requests` for contacts. `tests/fakes.py`
+provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` for fakes.
 
 **CardDAV is hand-rolled** and has the most structure. `_addressbook_urls` → `_fetch_cards`
 → `_put_card` is the shared transport; every contact tool goes through it. `_fetch_cards`
@@ -61,10 +62,22 @@ property names seen concatenated into other values. `REV`, `URL`, `NOTE`, `PHOTO
 data. Tests pin this. `TEL`/`EMAIL` get the broader `_EMBEDDED_PROPERTY_RE` only because
 they never legitimately contain a colon.
 
-**Write tools default to `dry_run=True`** and are annotated `destructiveHint`. They back up
-originals to `backups/` and send `If-Match` so a concurrent edit from another device is
-reported rather than clobbered. `contact_ids=[]` raises rather than matching everything.
-Get explicit user confirmation before any `dry_run=False` run against the live account.
+**Write tools default to `dry_run=True`** and are annotated `destructiveHint`. Contact
+writes back up originals to `backups/` and send `If-Match` so a concurrent edit from another
+device is reported rather than clobbered. `contact_ids=[]` and `message_ids=[]` raise rather
+than matching everything. Get explicit user confirmation before any `dry_run=False` run
+against the live account.
+
+**`delete_emails` fails whole, not partial.** Message ids are IMAP UIDs and are per-folder;
+if any requested id is missing from the folder the tool raises before acting on the rest.
+The default action is a single `MOVE` to Trash (found via `find_special_folder`, which is
+`Deleted Messages` on iCloud). `permanent=True` writes each message to
+`backups/mail-<stamp>/*.eml` first, then flags `\Deleted` and issues `UID EXPUNGE` for
+just those UIDs; a plain `EXPUNGE` would also purge messages other clients flagged.
+
+**iCloud SMTP does not file sent mail.** `send_email` APPENDs a copy to the Sent folder over
+IMAP after delivery. That step runs after the message has left, so it logs and reports
+`saved_to_sent: False` rather than raising. Bcc recipients go only in the SMTP envelope.
 
 **`load_dotenv` resolves `.env` relative to the source file**, not the cwd — MCP clients
 launch servers from arbitrary directories.
