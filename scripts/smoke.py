@@ -98,13 +98,34 @@ def dry_runs(uid):
 def calendar():
     result = server.get_calendar_events(limit=3)
     for e in result:
-        show(e.get("start", ""), e.get("summary", ""))
+        show(e.get("start", ""), f"{e.get('summary', '')}  id={e.get('id', '')!r} cal={e.get('calendar', '')!r}")
+    return result
+
+
+def calendar_dry_runs(events):
+    names = sorted({e["calendar"] for e in events})
+    show("calendars seen", names)
+    target = names[0] if names else None
+    r = server.create_event(summary="(smoke test, not created)", start="2026-12-31T15:00:00-06:00", calendar=target)
+    show("create_event", f"calendar={r['calendar']!r} start={r['start']} end={r['end']} created={r['created']}")
+    if events and events[0]["id"]:
+        r = server.delete_event(events[0]["id"])
+        show("delete_event", f"{r['summary']!r} in {r['calendar']!r} deleted={r['deleted']}")
+
+
+def contact_dry_runs(contacts):
+    r = server.create_contact(name="Smoke Test", emails=["smoke@example.com"])
+    show("create_contact", f"addressbook={r['addressbook']!r} name={r['contact']['name']!r} created={r['created']}")
+    if contacts:
+        r = server.delete_contact(contacts[0]["id"])
+        show("delete_contact", f"{r['contact']['name']!r} deleted={r['deleted']}")
 
 
 def contacts():
     result = server.search_contacts(limit=3)
     for c in result:
         show(c.get("id", ""), c.get("name", ""))
+    return result
 
 
 trash_name = None
@@ -123,8 +144,10 @@ def main():
         step("write tools, dry run", lambda: dry_runs(uid))
     else:
         print("   INBOX is empty; skipping message-level checks")
-    step("get_calendar_events", calendar)
-    step("search_contacts", contacts)
+    events = step("get_calendar_events", calendar) or []
+    step("calendar write tools, dry run", lambda: calendar_dry_runs(events))
+    found = step("search_contacts", contacts) or []
+    step("contact write tools, dry run", lambda: contact_dry_runs(found))
 
     print()
     if failures:

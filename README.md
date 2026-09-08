@@ -46,7 +46,7 @@ directory a client launches it from.
 | `list_folders()` | Every mail folder with its role (inbox, sent, trash, ...) and message and unseen counts. |
 | `search_emails(query, folder, limit)` | Search a mail folder with an IMAP query. Returns sender, subject, date and a decoded body preview, newest first. |
 | `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
-| `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. |
+| `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. Each carries an `id` for `delete_event`. |
 | `search_contacts(query, limit)` | Search all address books. Returns id, name, organization, and every email and phone per contact. |
 | `search_notes(query, limit)` | Legacy IMAP notes only — see the caveat below. |
 
@@ -58,7 +58,11 @@ directory a client launches it from.
 | `mark_emails(message_ids, folder, read, flagged, dry_run)` | Mark messages read/unread or flagged/unflagged. |
 | `delete_emails(message_ids, folder, permanent, dry_run)` | Move messages to Trash, or expunge them outright with `permanent=True`. |
 | `send_email(body, to, subject, cc, bcc, reply_to_id, reply_folder, dry_run)` | Send a plain-text email over SMTP and file a copy in Sent. Pass `reply_to_id` to reply in-thread. |
+| `create_event(summary, start, end, calendar, all_day, location, description, dry_run)` | Create a timed or all-day event. |
+| `delete_event(event_id, calendar, dry_run)` | Delete an event (every occurrence of a recurring one), backing up its iCalendar text first. |
+| `create_contact(name, phones, emails, organization, addressbook, dry_run)` | Create a contact. |
 | `update_contact(contact_id, name, phones, emails, dry_run)` | Edit one contact. |
+| `delete_contact(contact_id, dry_run)` | Delete a contact, backing up the card first. |
 | `repair_contacts(dry_run, limit, contact_ids)` | Fix systematic contact data defects in bulk or for a chosen subset. |
 
 Every write tool defaults to `dry_run=True`: it reports exactly what would change and sends
@@ -83,11 +87,22 @@ Mail:
   appends a copy to the Sent folder after delivery, the same way Mail.app does. If that step
   fails the message has still gone out; the result says `saved_to_sent: false`.
 
+Calendar:
+
+- **Explicit targets.** `create_event` needs `calendar=` when the account has more than one,
+  rather than guessing. Naive times are treated as UTC, so pass an offset for local times.
+  All-day events take dates, with `end` being the day after the last day.
+- **Backups.** `delete_event` saves the event's iCalendar text to `backups/` before removing
+  it. Deleting a recurring event removes every occurrence.
+
 Contacts:
 
+- **Creation is guarded.** `create_contact` PUTs with `If-None-Match: *`, so it can never
+  overwrite an existing card, and needs `addressbook=` only when there are several.
 - **Surgical edits.** Only changed lines are rewritten; every other line — photos, custom
   properties, folded continuations — is preserved byte for byte.
-- **Backups.** Originals are saved to `backups/` as a timestamped `.vcf` before any write.
+- **Backups.** Originals are saved to `backups/` as a timestamped `.vcf` before any write,
+  including deletes. `delete_contact` sends `If-Match` too.
 - **Optimistic concurrency.** Every `PUT` carries an `If-Match` ETag, so an edit made on
   another device since the read is reported rather than clobbered.
 - **Idempotent.** Re-running a repair on an already-repaired card is a no-op.

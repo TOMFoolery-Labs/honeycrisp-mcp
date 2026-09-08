@@ -259,6 +259,25 @@ def test_no_address_books_returns_empty():
     assert server.search_contacts() == []
 
 
+def test_spurious_401_during_discovery_is_retried(monkeypatch):
+    # Observed live: iCloud intermittently 401s a correctly authenticated PROPFIND.
+    monkeypatch.setattr(server, "CARDDAV_RETRY_DELAY", 0)
+    http = FakeHTTP([FakeResponse(PRINCIPAL_XML), FakeResponse("", status_code=401),
+                     FakeResponse(HOME_XML), FakeResponse(collections_xml("card")), FakeResponse(report_xml())])
+    server.requests.request = http
+    assert server.search_contacts() == []
+    assert [c["method"] for c in http.calls].count("PROPFIND") == 4
+
+
+def test_persistent_401_is_reported_after_retries(monkeypatch):
+    monkeypatch.setattr(server, "CARDDAV_RETRY_DELAY", 0)
+    http = FakeHTTP([FakeResponse("", status_code=401)] * (server.CARDDAV_401_RETRIES + 1))
+    server.requests.request = http
+    with pytest.raises(ToolError, match="401"):
+        server.search_contacts()
+    assert len(http.calls) == server.CARDDAV_401_RETRIES + 1
+
+
 def test_failed_discovery_raises():
     server.requests.request = FakeHTTP([FakeResponse("nope", status_code=500)])
     with pytest.raises(ToolError, match="PROPFIND failed"):

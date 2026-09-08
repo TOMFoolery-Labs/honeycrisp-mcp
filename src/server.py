@@ -17,6 +17,8 @@ import re
 import smtplib
 import sys
 import threading
+import time
+import uuid
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -29,6 +31,7 @@ from urllib.parse import urljoin
 from xml.sax.saxutils import escape as xml_escape
 
 import caldav
+from caldav.lib.error import NotFoundError
 import imapclient
 from imapclient.imapclient import SENT as SENT_FLAG, TRASH as TRASH_FLAG
 import requests
@@ -957,7 +960,8 @@ def get_calendar_events(start_date: Optional[str] = None, end_date: Optional[str
     Get calendar events from iCloud within a date range, across all calendars.
 
     Recurring events are expanded, so each occurrence in the range is returned
-    separately. Results are sorted by start time.
+    separately. Results are sorted by start time. Each result carries an 'id'
+    (the iCalendar UID) for use with delete_event.
 
     Args:
         start_date: ISO 8601 date string (e.g. '2026-01-01T00:00:00Z'). Defaults to now.
@@ -998,11 +1002,13 @@ def get_calendar_events(start_date: Optional[str] = None, end_date: Optional[str
                 summary = vevent.summary.value if hasattr(vevent, "summary") else "No Title"
                 raw_start = vevent.dtstart.value if hasattr(vevent, "dtstart") else None
                 raw_end = vevent.dtend.value if hasattr(vevent, "dtend") else None
+                uid = str(vevent.uid.value) if hasattr(vevent, "uid") else ""
             except Exception as e:
                 log.warning("Skipping unparseable event in %r: %s", calendar.name, e)
                 continue
 
             entry = {
+                "id": uid,
                 "calendar": calendar.name,
                 "summary": summary,
                 "start": raw_start.isoformat() if raw_start is not None else "",
@@ -1020,6 +1026,257 @@ def get_calendar_events(start_date: Optional[str] = None, end_date: Optional[str
 
     dated.sort(key=lambda pair: pair[0])
     return [entry for _, entry in dated][:limit] + undated[: max(0, limit - len(dated))]
+
+
+def _calendars() -> List[Any]:
+    try:
+        return list(get_caldav_client().principal().calendars())
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to connect to iCloud calendar: {e}") from e
+
+
+def _pick_calendar(calendars: List[Any], name: Optional[str]) -> Any:
+    """Choose the target calendar, refusing to guess between several."""
+    names = [c.name for c in calendars]
+    if not calendars:
+        raise ToolError("No calendars found on this account.")
+    if name:
+        match = next((c for c in calendars if c.name == name), None)
+        if match is None:
+            raise ToolError(f"No calendar named {name!r}. Available: {', '.join(map(repr, names))}.")
+        return match
+    if len(calendars) == 1:
+        return calendars[0]
+    raise ToolError(
+        f"This account has several calendars; pass calendar=... "
+        f"Available: {', '.join(map(repr, names))}."
+    )
+
+
+def _ical_escape(value: str) -> str:
+    return (value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\r\n", "\\n").replace("\n", "\\n"))
+
+
+def _ical_fold(line: str) -> str:
+    """Fold a content line at 75 octets as RFC 5545 requires."""
+    encoded = line.encode("utf-8")
+    if len(encoded) <= 75:
+        return line
+    pieces, current = [], b""
+    for ch in line:
+        b = ch.encode("utf-8")
+        limit = 75 if not pieces else 74
+        if len(current) + len(b) > limit:
+            pieces.append(current)
+            current = b""
+        current += b
+    pieces.append(current)
+    return "\r\n ".join(p.decode("utf-8") for p in pieces)
+
+
+def _parse_event_time(value: str, field: str, all_day: bool) -> Any:
+    if all_day:
+        try:
+            return date.fromisoformat(value.strip()[:10])
+        except ValueError as e:
+            raise ToolError(f"{field} must be a date (YYYY-MM-DD) for an all-day event, got {value!r}.") from e
+    return _parse_iso(value, field)
+
+
+def _ical_time(value: Any, prop: str) -> str:
+    if isinstance(value, datetime):
+        return f"{prop}:{value.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    return f"{prop};VALUE=DATE:{value.strftime('%Y%m%d')}"
+
+
+def _build_event_ical(uid: str, summary: str, start: Any, end: Any,
+                      location: Optional[str], description: Optional[str]) -> str:
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Honeycrisp//EN",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        _ical_time(start, "DTSTART"),
+        _ical_time(end, "DTEND"),
+        f"SUMMARY:{_ical_escape(summary)}",
+    ]
+    if location:
+        lines.append(f"LOCATION:{_ical_escape(location)}")
+    if description:
+        lines.append(f"DESCRIPTION:{_ical_escape(description)}")
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+    return "\r\n".join(_ical_fold(line) for line in lines) + "\r\n"
+
+
+def _backup_text(prefix: str, ext: str, text: str) -> str:
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(BACKUP_DIR, f"{prefix}-{stamp}.{ext}")
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    return path
+
+
+def _event_by_uid(calendar: Any, uid: str) -> Optional[Any]:
+    """Locate an event in one calendar by UID, or return None.
+
+    iCloud stores each event at <calendar>/<UID>.ics and rejects the
+    calendar-query-by-UID REPORT with 412, so a direct GET is tried first and
+    the REPORT is kept only as a fallback for servers that lay objects out
+    differently.
+    """
+    url = str(calendar.url).rstrip("/") + "/" + uid + ".ics"
+    try:
+        event = caldav.Event(calendar.client, url=url, parent=calendar)
+        event.load()
+        return event
+    except NotFoundError:
+        pass
+    except Exception as e:
+        log.debug("Direct GET of %s failed: %s", url, e)
+    try:
+        return calendar.get_event_by_uid(uid)
+    except NotFoundError:
+        return None
+
+
+def _event_summary(event: Any) -> Dict[str, Any]:
+    try:
+        vevent = event.vobject_instance.vevent
+        raw_start = vevent.dtstart.value if hasattr(vevent, "dtstart") else None
+        raw_end = vevent.dtend.value if hasattr(vevent, "dtend") else None
+        return {
+            "summary": vevent.summary.value if hasattr(vevent, "summary") else "No Title",
+            "start": raw_start.isoformat() if raw_start is not None else "",
+            "end": raw_end.isoformat() if raw_end is not None else "",
+        }
+    except Exception as e:
+        log.debug("Could not summarise event: %s", e)
+        return {"summary": "", "start": "", "end": ""}
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+def create_event(
+    summary: str,
+    start: str,
+    end: Optional[str] = None,
+    calendar: Optional[str] = None,
+    all_day: bool = False,
+    location: Optional[str] = None,
+    description: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Create a calendar event. Preview first.
+
+    Times are ISO 8601; a value without an offset is treated as UTC, so pass
+    an offset (e.g. '2026-09-10T15:00:00-05:00') for local times. All-day
+    events take dates (YYYY-MM-DD) and 'end' is the day after the last day.
+
+    Args:
+        summary: Event title.
+        start: Start datetime, or start date when all_day is True.
+        end: End datetime or date. Defaults to one hour after start, or the
+            next day for all-day events.
+        calendar: Calendar name (see get_calendar_events results). Required
+            when the account has more than one calendar.
+        all_day: Create an all-day event.
+        location: Optional location text.
+        description: Optional notes.
+        dry_run: When True (the default) return the event without creating it.
+    """
+    if not summary.strip():
+        raise ToolError("summary is required.")
+    start_value = _parse_event_time(start, "start", all_day)
+    if end:
+        end_value = _parse_event_time(end, "end", all_day)
+    else:
+        end_value = start_value + (timedelta(days=1) if all_day else timedelta(hours=1))
+    if end_value <= start_value:
+        raise ToolError(f"end ({end_value.isoformat()}) must be after start ({start_value.isoformat()}).")
+
+    target = _pick_calendar(_calendars(), calendar)
+    uid = str(uuid.uuid4()).upper()
+    ical = _build_event_ical(uid, summary.strip(), start_value, end_value, location, description)
+
+    if not dry_run:
+        try:
+            target.add_event(ical=ical, no_overwrite=True)
+        except Exception as e:
+            raise ToolError(f"Creating the event in {target.name!r} failed: {e}") from e
+
+    return {
+        "dry_run": dry_run,
+        "created": not dry_run,
+        "id": uid,
+        "calendar": target.name,
+        "summary": summary.strip(),
+        "start": start_value.isoformat(),
+        "end": end_value.isoformat(),
+        "all_day": all_day,
+        "location": location or "",
+        "description": description or "",
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True})
+def delete_event(event_id: str, calendar: Optional[str] = None, dry_run: bool = True) -> Dict[str, Any]:
+    """
+    Delete a calendar event. Modifies live data -- preview first.
+
+    Deleting a recurring event removes every occurrence. The event's
+    iCalendar text is saved under backups/ before it is removed.
+
+    Args:
+        event_id: The 'id' from get_calendar_events.
+        calendar: Calendar name, to skip searching the others.
+        dry_run: When True (the default) report the event without deleting it.
+    """
+    uid = event_id.strip()
+    if not uid:
+        raise ToolError("event_id is required; use the 'id' field from get_calendar_events.")
+
+    calendars = _calendars()
+    if calendar:
+        calendars = [_pick_calendar(calendars, calendar)]
+
+    found, failures = None, []
+    for cal in calendars:
+        try:
+            event = _event_by_uid(cal, uid)
+        except Exception as e:
+            failures.append(f"{cal.name!r}: {e}")
+            log.warning("Lookup failed in calendar %r: %s", cal.name, e)
+            continue
+        if event is not None:
+            found = (cal, event)
+            break
+    if found is None:
+        hint = f" Lookup failed in {', '.join(failures)}." if failures else ""
+        raise ToolError(f"No event found with id {uid!r}.{hint}")
+    cal, event = found
+
+    backup_path = None
+    if not dry_run:
+        backup_path = _backup_text("event", "ics", str(event.data or ""))
+        try:
+            event.delete()
+        except Exception as e:
+            raise ToolError(f"Deleting the event from {cal.name!r} failed: {e}") from e
+
+    return {
+        "dry_run": dry_run,
+        "deleted": not dry_run,
+        "id": uid,
+        "calendar": cal.name,
+        "backup": backup_path,
+        **_event_summary(event),
+    }
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -1048,14 +1305,26 @@ def search_notes(query: str = "ALL", limit: int = 10) -> List[Dict[str, str]]:
         raise
 
 
+# iCloud intermittently answers a correctly authenticated discovery PROPFIND
+# with an empty 401 (observed 2026-09-08 on the principal URL, clearing within
+# seconds), so a 401 is retried briefly before being reported as an auth error.
+CARDDAV_401_RETRIES = 3
+CARDDAV_RETRY_DELAY = 1.5
+
+
 def _carddav_propfind(url: str, depth: int, body: str, auth: HTTPBasicAuth) -> ET.Element:
-    response = requests.request(
-        "PROPFIND", url,
-        auth=auth,
-        headers={"Depth": str(depth), "Content-Type": "application/xml; charset=utf-8"},
-        data=body.encode("utf-8"),
-        timeout=HTTP_TIMEOUT,
-    )
+    for attempt in range(CARDDAV_401_RETRIES + 1):
+        response = requests.request(
+            "PROPFIND", url,
+            auth=auth,
+            headers={"Depth": str(depth), "Content-Type": "application/xml; charset=utf-8"},
+            data=body.encode("utf-8"),
+            timeout=HTTP_TIMEOUT,
+        )
+        if response.status_code != 401 or attempt == CARDDAV_401_RETRIES:
+            break
+        log.warning("CardDAV PROPFIND %s returned 401; retrying (%d/%d).", url, attempt + 1, CARDDAV_401_RETRIES)
+        time.sleep(CARDDAV_RETRY_DELAY)
     if response.status_code not in (200, 207):
         raise ToolError(f"CardDAV PROPFIND failed ({response.status_code}): {response.text[:200]}")
     return ET.fromstring(response.text)
@@ -1671,6 +1940,160 @@ def repair_contacts(
         "backup": backup_path,
         "failures": failures,
         "contacts": report,
+    }
+
+
+def _build_vcard(name: str, phones: List[str], emails: List[str], organization: str) -> Tuple[str, str]:
+    """Assemble a new vCard 3.0 in the shape Apple stores. Returns (uid, text)."""
+    uid = str(uuid.uuid4()).upper()
+    parts = name.split()
+    structured = f"{_vcard_escape(parts[-1])};{_vcard_escape(' '.join(parts[:-1]))};;;" if parts else ";;;;"
+    lines = [
+        "BEGIN:VCARD",
+        "VERSION:3.0",
+        "PRODID:-//Honeycrisp//EN",
+        f"N:{structured}",
+        f"FN:{_vcard_escape(name or organization)}",
+    ]
+    if organization:
+        lines.append(f"ORG:{_vcard_escape(organization)};")
+    lines += [f"EMAIL;TYPE=INTERNET:{_vcard_escape(e)}" for e in emails]
+    lines += [f"TEL;TYPE=CELL:{_vcard_escape(p)}" for p in phones]
+    lines += [
+        f"UID:{uid}",
+        f"REV:{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        "END:VCARD",
+    ]
+    return uid, "\r\n".join(lines) + "\r\n"
+
+
+def _create_card(auth: HTTPBasicAuth, url: str, text: str) -> None:
+    """PUT a brand-new card; If-None-Match guarantees nothing is overwritten."""
+    response = requests.request(
+        "PUT", url, auth=auth,
+        headers={"Content-Type": "text/vcard; charset=utf-8", "If-None-Match": "*"},
+        data=text.encode("utf-8"), timeout=HTTP_TIMEOUT,
+    )
+    if response.status_code == 412:
+        raise ToolError(f"A card already exists at {url}; nothing was written.")
+    if response.status_code not in (200, 201, 204):
+        raise ToolError(f"Creating {url} failed ({response.status_code}): {response.text[:200]}")
+
+
+def _delete_card(auth: HTTPBasicAuth, card: Card) -> None:
+    headers = {"If-Match": card.etag} if card.etag else {}
+    response = requests.request("DELETE", card.url, auth=auth, headers=headers, timeout=HTTP_TIMEOUT)
+    if response.status_code == 412:
+        raise ToolError(
+            f"{card.url} changed on the server since it was read; nothing was deleted. "
+            "Re-run to pick up the current version."
+        )
+    if response.status_code not in (200, 202, 204):
+        raise ToolError(f"Deleting {card.url} failed ({response.status_code}): {response.text[:200]}")
+
+
+def _pick_addressbook(urls: List[str], name: Optional[str]) -> str:
+    """Choose the target address book by its last path segment, never by guessing."""
+    if not urls:
+        raise ToolError("No address books found on this account.")
+    labels = {u.rstrip("/").rsplit("/", 1)[-1]: u for u in urls}
+    if name:
+        if name not in labels:
+            raise ToolError(f"No address book named {name!r}. Available: {', '.join(map(repr, labels))}.")
+        return labels[name]
+    if len(urls) == 1:
+        return urls[0]
+    raise ToolError(
+        f"This account has several address books; pass addressbook=... "
+        f"Available: {', '.join(map(repr, labels))}."
+    )
+
+
+def _clean_list(values: Optional[List[str]]) -> List[str]:
+    return [v.strip() for v in values or [] if v and v.strip()]
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+def create_contact(
+    name: Optional[str] = None,
+    phones: Optional[List[str]] = None,
+    emails: Optional[List[str]] = None,
+    organization: Optional[str] = None,
+    addressbook: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Create a contact in iCloud. Preview first.
+
+    Args:
+        name: Full display name, e.g. 'Dana Whitfield'. The last word becomes
+            the family name. Required unless organization is given.
+        phones: Phone numbers.
+        emails: Email addresses.
+        organization: Company or organisation.
+        addressbook: Address book to create in; required only when the
+            account has more than one.
+        dry_run: When True (the default) return the card without creating it.
+    """
+    name = (name or "").strip()
+    organization = (organization or "").strip()
+    if not name and not organization:
+        raise ToolError("Pass a name or an organization.")
+    phones, emails = _clean_list(phones), _clean_list(emails)
+    for e in emails:
+        if "@" not in e or any(c.isspace() for c in e):
+            raise ToolError(f"Invalid email address {e!r}.")
+
+    address, password = _require_credentials()
+    auth = HTTPBasicAuth(address, password)
+    book = _pick_addressbook(_addressbook_urls(auth), addressbook)
+    uid, text = _build_vcard(name, phones, emails, organization)
+    url = urljoin(book, f"{uid}.vcf")
+
+    if not dry_run:
+        _create_card(auth, url, text)
+
+    return {
+        "dry_run": dry_run,
+        "created": not dry_run,
+        "addressbook": book.rstrip("/").rsplit("/", 1)[-1],
+        "contact": _summarise(text),
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True})
+def delete_contact(contact_id: str, dry_run: bool = True) -> Dict[str, Any]:
+    """
+    Delete one contact from iCloud. Modifies live data -- preview first.
+
+    The card is saved to backups/ before deletion, and the DELETE carries an
+    If-Match ETag so a card edited on another device since it was read is
+    left alone.
+
+    Args:
+        contact_id: The 'id' (vCard UID) from search_contacts.
+        dry_run: When True (the default) report the contact without deleting it.
+    """
+    uid = contact_id.strip()
+    if not uid:
+        raise ToolError("contact_id is required; use the 'id' field from search_contacts.")
+
+    address, password = _require_credentials()
+    auth = HTTPBasicAuth(address, password)
+    match = next((c for c in _fetch_cards(auth) if _card_uid(c.raw) == uid), None)
+    if match is None:
+        raise ToolError(f"No contact found with id {uid!r}.")
+
+    backup_path = None
+    if not dry_run:
+        backup_path = _backup([(match, match.raw)])
+        _delete_card(auth, match)
+
+    return {
+        "dry_run": dry_run,
+        "deleted": not dry_run,
+        "backup": backup_path,
+        "contact": _summarise_safely(match.raw),
     }
 
 

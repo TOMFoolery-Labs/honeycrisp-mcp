@@ -167,8 +167,16 @@ class FakeSMTP:
 
 
 class FakeEvent:
-    def __init__(self, vobject_instance):
+    def __init__(self, vobject_instance, data="", delete_error=None):
         self.vobject_instance = vobject_instance
+        self.data = data
+        self.delete_error = delete_error
+        self.deleted = False
+
+    def delete(self):
+        if self.delete_error:
+            raise self.delete_error
+        self.deleted = True
 
 
 class _Attr:
@@ -177,9 +185,11 @@ class _Attr:
 
 
 class FakeVEvent:
-    def __init__(self, summary=None, dtstart=None, dtend=None):
+    def __init__(self, summary=None, dtstart=None, dtend=None, uid=None):
         if summary is not None:
             self.summary = _Attr(summary)
+        if uid is not None:
+            self.uid = _Attr(uid)
         if dtstart is not None:
             self.dtstart = _Attr(dtstart)
         if dtend is not None:
@@ -192,17 +202,37 @@ class FakeVObject:
 
 
 class FakeCalendar:
-    def __init__(self, name, events=(), error=None):
+    def __init__(self, name, events=(), error=None, add_error=None):
         self.name = name
+        self.url = f"https://caldav.example.com/cal/{name}/"
+        self.client = None
         self._events = list(events)
         self.error = error
+        self.add_error = add_error
         self.search_kwargs = None
+        self.added = []
 
     def search(self, **kwargs):
         self.search_kwargs = kwargs
         if self.error:
             raise self.error
         return self._events
+
+    def add_event(self, ical=None, no_overwrite=False, no_create=False, **kwargs):
+        if self.add_error:
+            raise self.add_error
+        self.added.append({"ical": ical, "no_overwrite": no_overwrite})
+        return FakeEvent(None, data=ical)
+
+    def get_event_by_uid(self, uid):
+        from caldav.lib.error import NotFoundError
+        if self.error:
+            raise self.error
+        for event in self._events:
+            vevent = event.vobject_instance.vevent
+            if getattr(vevent, "uid", None) is not None and vevent.uid.value == uid:
+                return event
+        raise NotFoundError(f"no event with uid {uid}")
 
 
 class FakePrincipal:
@@ -221,8 +251,8 @@ class FakeDAVClient:
         return FakePrincipal(self._calendars)
 
 
-def make_event(summary, dtstart, dtend=None):
-    return FakeEvent(FakeVObject(FakeVEvent(summary, dtstart, dtend)))
+def make_event(summary, dtstart, dtend=None, uid=None, data="", delete_error=None):
+    return FakeEvent(FakeVObject(FakeVEvent(summary, dtstart, dtend, uid)), data=data, delete_error=delete_error)
 
 
 # --- CardDAV canned responses (Apple returns ABSOLUTE hrefs on partition hosts)
@@ -309,11 +339,13 @@ class FakeHTTP:
     can assert on exactly what would hit the server.
     """
 
-    def __init__(self, responses, put_status=204):
+    def __init__(self, responses, put_status=204, delete_status=204):
         self.responses = list(responses)
         self.calls = []
         self.writes = []
+        self.deletes = []
         self.put_status = put_status
+        self.delete_status = delete_status
 
     def __call__(self, method, url, **kwargs):
         self.calls.append({
@@ -328,8 +360,15 @@ class FakeHTTP:
                 "url": url,
                 "body": (kwargs.get("data") or b"").decode("utf-8"),
                 "if_match": (kwargs.get("headers") or {}).get("If-Match"),
+                "if_none_match": (kwargs.get("headers") or {}).get("If-None-Match"),
             })
             return FakeResponse("", status_code=self.put_status)
+        if method == "DELETE":
+            self.deletes.append({
+                "url": url,
+                "if_match": (kwargs.get("headers") or {}).get("If-Match"),
+            })
+            return FakeResponse("", status_code=self.delete_status)
         if not self.responses:
             raise AssertionError(f"unexpected extra request: {method} {url}")
         return self.responses.pop(0)

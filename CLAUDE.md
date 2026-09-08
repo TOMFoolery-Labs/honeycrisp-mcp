@@ -20,13 +20,14 @@ Live checks against the real account require `.env` (`ICLOUD_EMAIL`, `ICLOUD_APP
 
 ## Architecture
 
-One module, `src/server.py`, exposing twelve FastMCP tools over four protocols: IMAP for mail
+One module, `src/server.py`, exposing sixteen FastMCP tools over four protocols: IMAP for mail
 and legacy notes, SMTP (stdlib `smtplib`, STARTTLS on 587) for sending, CalDAV (via the
 `caldav` lib) for calendar, and raw CardDAV over `requests` for contacts. `tests/fakes.py`
 provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` for fakes.
 
 **CardDAV is hand-rolled** and has the most structure. `_addressbook_urls` → `_fetch_cards`
-→ `_put_card` is the shared transport; every contact tool goes through it. `_fetch_cards`
+→ `_put_card` / `_create_card` / `_delete_card` is the shared transport; every contact tool
+goes through it. `_fetch_cards`
 returns `Card(url, etag, raw)` — the ETag is what makes safe writes possible. Read and write
 paths share this layer, so changes to discovery affect both.
 
@@ -62,9 +63,11 @@ property names seen concatenated into other values. `REV`, `URL`, `NOTE`, `PHOTO
 data. Tests pin this. `TEL`/`EMAIL` get the broader `_EMBEDDED_PROPERTY_RE` only because
 they never legitimately contain a colon.
 
-**Write tools default to `dry_run=True`** and are annotated `destructiveHint`. Contact
-writes back up originals to `backups/` and send `If-Match` so a concurrent edit from another
-device is reported rather than clobbered. `contact_ids=[]` and `message_ids=[]` raise rather
+**Write tools default to `dry_run=True`** and destructive ones are annotated
+`destructiveHint`. Contact writes and deletes back up originals to `backups/` and send
+`If-Match` so a concurrent edit from another device is reported rather than clobbered;
+`create_contact` sends `If-None-Match: *` instead. `delete_event` backs up the `.ics`.
+`_pick_calendar` and `_pick_addressbook` refuse to guess when there are several targets. `contact_ids=[]` and `message_ids=[]` raise rather
 than matching everything. Get explicit user confirmation before any `dry_run=False` run
 against the live account.
 
@@ -114,5 +117,12 @@ fixtures include a card whose inline photo is deliberately undecodable, because 
   `UIDPLUS` is present. Trash is `Deleted Messages`, Sent is `Sent Messages`. Every mail
   write tool was verified live the same day with `scripts/roundtrip.py`; self-addressed
   delivery took over 90 s on one run, so waits in live scripts must be generous.
+- **iCloud CalDAV rejects the by-UID `calendar-query` REPORT with 412** but serves every
+  event at `<calendar>/<UID>.ics`. `_event_by_uid` does the direct GET first and keeps the
+  REPORT only as a fallback. Verified 2026-09-08.
+- **iCloud CardDAV intermittently returns an empty 401** to a correctly authenticated
+  discovery PROPFIND (seen on the principal URL, clearing within seconds). It also varies
+  between absolute partition-host hrefs and relative ones. `_carddav_propfind` retries a
+  401 a few times before treating it as an auth failure.
 - **Notes sync over CloudKit, not IMAP.** `search_notes` reaches only legacy IMAP notes and
   is empty for most accounts; an empty result is not evidence the user has no notes.
