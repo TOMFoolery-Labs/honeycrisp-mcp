@@ -91,7 +91,11 @@ use it: text/plain preferred, otherwise HTML converted with `_html_to_text`, whi
 entities. Previews then collapse whitespace via `_truncate`; full bodies keep line structure.
 
 **`load_dotenv` resolves `.env` relative to the source file**, not the cwd — MCP clients
-launch servers from arbitrary directories.
+launch servers from arbitrary directories. `pyproject.toml` installs `src/server.py` as the
+top-level module `server` with a `honeycrisp` console script (`main()`); installed that way
+there is no `.env` or `backups/` beside the module, so credentials come from the client's
+`env` block and `_default_backup_dir` falls back to `~/.honeycrisp/backups`. Never write
+user data relative to `__file__` without going through that helper.
 
 ## Test fixtures must mirror the real wire
 

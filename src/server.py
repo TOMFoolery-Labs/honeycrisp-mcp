@@ -78,10 +78,23 @@ DEFAULT_BODY_CHARS = 20000
 # against iCloud pulls down every event in every calendar.
 DEFAULT_CALENDAR_WINDOW = timedelta(days=90)
 
-# Pre-change copies of any card the server writes, and full copies of any
-# message it deletes permanently, are saved here.
+# Pre-change copies of any card or event the server writes, and full copies
+# of any message it deletes permanently, are saved here.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BACKUP_DIR = os.path.join(PROJECT_ROOT, "backups")
+
+
+def _default_backup_dir(source_root: str) -> str:
+    """backups/ beside the source checkout, or ~/.honeycrisp/backups when installed.
+
+    When the module is installed as a package, source_root is a site-packages
+    directory that must never receive user data.
+    """
+    if os.path.isdir(os.path.join(source_root, "src")) and os.path.isfile(os.path.join(source_root, "src", "server.py")):
+        return os.path.join(source_root, "backups")
+    return os.path.join(os.path.expanduser("~"), ".honeycrisp", "backups")
+
+
+BACKUP_DIR = os.getenv("HONEYCRISP_BACKUP_DIR") or _default_backup_dir(PROJECT_ROOT)
 
 if not ICLOUD_EMAIL or not ICLOUD_APP_PASSWORD:
     log.warning("ICLOUD_EMAIL and ICLOUD_APP_PASSWORD must be set in the environment.")
@@ -2097,6 +2110,10 @@ def delete_contact(contact_id: str, dry_run: bool = True) -> Dict[str, Any]:
     }
 
 
-if __name__ == "__main__":
-    # Run the server using stdin/stdout streams
+def main() -> None:
+    """Console entry point: serve over stdin/stdout."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

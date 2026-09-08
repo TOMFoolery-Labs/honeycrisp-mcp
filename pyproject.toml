@@ -1,0 +1,38 @@
+[project]
+name = "honeycrisp-mcp"
+version = "0.1.0"
+description = "MCP server for iCloud Mail, Calendar, Contacts and Notes using an app-specific password."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "caldav>=3.2.1,<4",
+    "fastmcp>=3.4.7,<4",
+    "imapclient>=3.1.0,<4",
+    "python-dotenv>=1.2.3,<2",
+    "requests>=2.34.2,<3",
+    "vobject>=0.9.9,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.1.1"]
+
+[project.scripts]
+honeycrisp = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The server is a single module, src/server.py, installed as the top-level
+# module `server`. That name is fine inside the isolated venv `uv tool` or
+# `uvx` creates for the package, which is the intended way to install it.
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+only-include = ["src/server.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/server.py", "README.md", "CLAUDE.md", "tests", "scripts", "requirements*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

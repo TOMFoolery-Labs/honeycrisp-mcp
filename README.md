@@ -15,16 +15,41 @@ CardDAV for contacts), so no private API and no Apple ID password are involved.
    ICLOUD_APP_PASSWORD=your-app-specific-password
    ```
    `.env` is gitignored. Never commit it.
-3. Install and run:
+3. Install and run, either as a tool or from a checkout:
    ```bash
+   uv tool install git+https://github.com/TOMFoolery-Labs/honeycrisp-mcp   # puts `honeycrisp` on PATH
+   honeycrisp
+
+   # or, from a clone
    uv venv && uv pip install -r requirements.txt   # or: pip install -r requirements.txt
    .venv/bin/python src/server.py
    ```
 
-`.env` is resolved relative to the source file, so the server works no matter which
-directory a client launches it from.
+`.env` is resolved relative to the source file, so a checkout works no matter which
+directory a client launches it from. A tool install has no checkout, so pass the two
+variables through the client's `env` block instead. Backups go to `backups/` beside a
+checkout, or `~/.honeycrisp/backups` for a tool install; `HONEYCRISP_BACKUP_DIR` overrides
+both.
 
 ### Registering with an MCP client
+
+Tool install:
+
+```json
+{
+  "mcpServers": {
+    "honeycrisp": {
+      "command": "honeycrisp",
+      "env": {
+        "ICLOUD_EMAIL": "your.email@icloud.com",
+        "ICLOUD_APP_PASSWORD": "your-app-specific-password"
+      }
+    }
+  }
+}
+```
+
+Checkout:
 
 ```json
 {

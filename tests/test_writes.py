@@ -1,4 +1,6 @@
 """Write-path tests. Nothing here touches a real account."""
+import os
+
 import pytest
 from fastmcp.exceptions import ToolError
 
@@ -28,6 +30,25 @@ def install(*extra, put_status=204):
 @pytest.fixture(autouse=True)
 def isolate_backups(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "BACKUP_DIR", str(tmp_path / "backups"))
+
+
+# --------------------------------------------------------------------------
+# Backup location
+# --------------------------------------------------------------------------
+
+def test_backups_live_beside_a_source_checkout(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "server.py").write_text("")
+    assert server._default_backup_dir(str(tmp_path)) == str(tmp_path / "backups")
+
+
+def test_backups_never_land_inside_an_installed_package(tmp_path):
+    # An installed module sits in site-packages; PROJECT_ROOT is then its parent.
+    site = tmp_path / "lib" / "python3.14" / "site-packages"
+    site.mkdir(parents=True)
+    result = server._default_backup_dir(str(site.parent))
+    assert result == os.path.join(os.path.expanduser("~"), ".honeycrisp", "backups")
+    assert not result.startswith(str(tmp_path))
 
 
 # --------------------------------------------------------------------------
