@@ -194,6 +194,13 @@ one request per call instead of four. If you see it, wait a few minutes.
 reachable here. `search_notes` sees only notes stored on the IMAP account, which for most
 accounts is empty. An empty result does not mean the user has no notes.
 
+**Reminders.** The same applies to Reminders since Apple's 2019 upgrade: they sync over
+CloudKit and are not exposed over CalDAV. What CalDAV shows is each upgraded list as a
+calendar of kind `reminders` (often with a warning emoji in the name) holding two Apple
+placeholder items: "The creator of this list has upgraded these reminders" and "Where are my
+reminders?". Nothing written there reaches the Reminders app, so there are no reminders
+tools. See [Apple's note](https://support.apple.com/HT210220).
+
 ## Behaviour
 
 - **Errors are raised, not returned.** Tools raise `ToolError` so the client sees a real

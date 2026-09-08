@@ -115,7 +115,8 @@ forward_email, mark_emails, move_emails and delete_emails change the mailbox. de
 moves to Trash unless permanent=True.
 
 Calendar: list_calendars shows calendars and Reminders lists (kind 'reminders' cannot hold \
-events). get_calendar_events returns ids for update_event and delete_event; create_event \
+events, and on accounts using upgraded Reminders those lists hold only Apple's placeholder \
+items; real reminders sync over CloudKit and are not reachable here). get_calendar_events returns ids for update_event and delete_event; create_event \
 needs calendar= when the account has several. Times are ISO 8601; a value without an \
 offset is treated as UTC, so pass an offset for local times.
 
@@ -1442,7 +1443,10 @@ def list_calendars() -> List[Dict[str, Any]]:
 
     Use the 'name' as the 'calendar' argument to create_event and friends.
     'kind' is 'events' for a normal calendar or 'reminders' for a Reminders
-    list (which CalDAV exposes the same way but cannot hold events).
+    list (which CalDAV exposes the same way but cannot hold events). Since
+    2019 Apple's upgraded Reminders sync over CloudKit, not CalDAV: such
+    lists show up here with only placeholder items, and nothing written to
+    them appears in the Reminders app.
     """
     return [_calendar_info(c) for c in _calendars()]
 

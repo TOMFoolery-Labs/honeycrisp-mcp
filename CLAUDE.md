@@ -165,6 +165,12 @@ fixtures include a card whose inline photo is deliberately undecodable, because 
   `VTODO` only. On this account they are the ones with ⚠️ in the name. `list_calendars`
   reads that property (plus privileges, resourcetype and Apple's `calendar-color`) with one
   raw PROPFIND per calendar, because the `caldav` lib has no element for the privilege set.
+- **Upgraded Reminders are not reachable, so do not build reminders tools.** Probed
+  2026-09-08: both lists hold exactly two VTODOs created 2020-08-22, "The creator of this
+  list has upgraded these reminders" (DESCRIPTION links HT210220) and "Where are my
+  reminders?". Real reminders sync over CloudKit since the 2019 upgrade; a VTODO written
+  here never appears in the app. Also, `calendar.todos()` (which filters on completion) gets
+  a 500 from iCloud, while `search(todo=True, include_completed=True)` works.
 - **`update_event` edits through `event.icalendar_instance`**, never by re-serialising
   from vobject. Reading `event.data` first captures the raw bytes for the backup; touching
   the icalendar instance afterwards clears the cached raw data so `save()` serialises the
