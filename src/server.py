@@ -99,7 +99,37 @@ BACKUP_DIR = os.getenv("HONEYCRISP_BACKUP_DIR") or _default_backup_dir(PROJECT_R
 if not ICLOUD_EMAIL or not ICLOUD_APP_PASSWORD:
     log.warning("ICLOUD_EMAIL and ICLOUD_APP_PASSWORD must be set in the environment.")
 
-mcp = FastMCP("Honeycrisp")
+SERVER_VERSION = "0.1.0"
+
+# Sent to the client in the initialize handshake; clients pass it to the
+# model as guidance for using this server, so it covers what the tool
+# descriptions cannot: how the tools fit together and the iCloud quirks.
+SERVER_INSTRUCTIONS = """\
+Honeycrisp gives you the user's iCloud account: Mail (IMAP/SMTP), Calendar and \
+Reminders lists (CalDAV) and Contacts (CardDAV).
+
+Mail: list_folders shows folder names; search_emails finds messages with structured \
+filters (sender, subject, since, unread, ...); get_email returns one in full. Message ids \
+are specific to the folder they were found in. send_email (with reply_to_id for replies), \
+forward_email, mark_emails, move_emails and delete_emails change the mailbox. delete_emails \
+moves to Trash unless permanent=True.
+
+Calendar: list_calendars shows calendars and Reminders lists (kind 'reminders' cannot hold \
+events). get_calendar_events returns ids for update_event and delete_event; create_event \
+needs calendar= when the account has several. Times are ISO 8601; a value without an \
+offset is treated as UTC, so pass an offset for local times.
+
+Contacts: search_contacts matches the FN field server-side, so contacts with an empty \
+display name are only found with an empty query. create_contact, update_contact, \
+delete_contact and repair_contacts change the address book.
+
+Every tool that changes data defaults to dry_run=True and returns exactly what it would \
+do. Show that preview to the user and get their confirmation before calling again with \
+dry_run=False. Deletions and edits back up the original first. search_notes only sees \
+legacy IMAP notes, so an empty result does not mean the user has no notes.
+"""
+
+mcp = FastMCP("Honeycrisp", instructions=SERVER_INSTRUCTIONS, version=SERVER_VERSION)
 
 
 def _require_credentials() -> Tuple[str, str]:

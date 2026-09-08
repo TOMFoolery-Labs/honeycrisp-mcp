@@ -39,6 +39,11 @@ desynchronised the protocol).
 
 ## Constraints that will bite you
 
+**`SERVER_INSTRUCTIONS` is what the model reads about this server.** It goes out in the
+initialize handshake and clients feed it to the model as usage guidance, so when a tool is
+added, renamed or changes its contract, update that string too. Keep `SERVER_VERSION` in
+step with `pyproject.toml`.
+
 **stdout is the JSON-RPC stream.** This is a stdio server. Never `print()`; all diagnostics
 go through `log` to stderr. `tests/test_mail.py` asserts stdout stays byte-empty on import,
 both with and without credentials.
