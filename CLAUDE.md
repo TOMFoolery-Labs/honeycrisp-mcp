@@ -25,6 +25,10 @@ Live checks against the real account require `.env` (`ICLOUD_EMAIL`, `ICLOUD_APP
 .venv/bin/python scripts/roundtrip_pim.py            # calendar + contact writes, on tagged items
 ```
 
+CI (`.github/workflows/ci.yml`) runs the offline suite on Python 3.11–3.14 and then builds
+the wheel, installs it and completes an MCP handshake, so packaging breaks fail there too.
+It never has credentials; anything needing the live account stays in `scripts/`.
+
 The round trips send real mail and write real data (on items they create and remove). Run
 them deliberately, and not back to back: CardDAV throttles the account after bursts (see
 below). All twenty tools passed these live on 2026-09-08.

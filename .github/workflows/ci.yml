@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      # Tests are fully offline against tests/fakes.py; no credentials are set,
+      # and one test asserts the server imports cleanly without them.
+      - run: uv venv && uv pip install -r requirements-dev.txt
+      - run: uv run --no-project python -m pytest tests/ -q -p no:cacheprovider
+
+  build:
+    name: wheel builds and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv build
+      - name: install wheel and complete an MCP handshake over stdio
+        env:
+          ICLOUD_EMAIL: ci@example.com
+          ICLOUD_APP_PASSWORD: not-a-real-password
+        run: |
+          uv venv /tmp/wheelvenv
+          uv pip install --python /tmp/wheelvenv/bin/python dist/*.whl
+          cd /tmp && /tmp/wheelvenv/bin/python - <<'PY'
+          import json, select, subprocess
+          p = subprocess.Popen(["/tmp/wheelvenv/bin/honeycrisp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+          def send(m): p.stdin.write((json.dumps(m) + "\n").encode()); p.stdin.flush()
+          def recv(i):
+              while True:
+                  assert select.select([p.stdout], [], [], 30)[0], "no response"
+                  m = json.loads(p.stdout.readline())
+                  if m.get("id") == i: return m
+          send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "ci", "version": "0"}}})
+          assert recv(1)["result"]["serverInfo"]["name"] == "Honeycrisp"
+          send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+          send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+          tools = recv(2)["result"]["tools"]
+          assert len(tools) == 20, len(tools)
+          p.stdin.close(); p.wait(timeout=10)
+          print("handshake ok,", len(tools), "tools")
+          PY

@@ -1,5 +1,7 @@
 # Honeycrisp
 
+[![CI](https://github.com/TOMFoolery-Labs/honeycrisp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TOMFoolery-Labs/honeycrisp-mcp/actions/workflows/ci.yml)
+
 A Model Context Protocol (MCP) server for iCloud — Mail, Calendar, Contacts and Notes —
 using an Apple app-specific password. Twenty tools: read, search, send, edit and delete,
 every write previewed by default. All of them are verified against a real account.
@@ -227,6 +229,8 @@ uv pip install -r requirements-dev.txt
 ```
 
 Tests run fully offline against fakes in `tests/fakes.py` — no credentials, no network.
+CI (`.github/workflows/ci.yml`) runs them on Python 3.11 through 3.14 for every push and
+pull request, then builds the wheel, installs it and completes an MCP handshake over stdio.
 `scripts/smoke.py` is the complement: a read-only walk of every tool against the live
 account (needs `.env`) that also prints the server facts the mail tools rely on. On
 iCloud it shows no `MOVE` capability, so moves and deletes run the copy + flag +
