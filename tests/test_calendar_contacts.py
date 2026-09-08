@@ -259,6 +259,43 @@ def test_no_address_books_returns_empty():
     assert server.search_contacts() == []
 
 
+def test_discovery_is_cached_across_calls():
+    http = FakeHTTP([FakeResponse(PRINCIPAL_XML), FakeResponse(HOME_XML), FakeResponse(collections_xml("card")),
+                     FakeResponse(report_xml()), FakeResponse(report_xml())])
+    server.requests.request = http
+    server.search_contacts()
+    server.search_contacts()
+    methods = [c["method"] for c in http.calls]
+    assert methods == ["PROPFIND", "PROPFIND", "PROPFIND", "REPORT", "REPORT"], "second call must skip discovery"
+
+
+def test_discovery_cache_expires(monkeypatch):
+    monkeypatch.setattr(server, "ADDRESSBOOK_CACHE_TTL", 0)
+    http = FakeHTTP([FakeResponse(PRINCIPAL_XML), FakeResponse(HOME_XML), FakeResponse(collections_xml("card")), FakeResponse(report_xml()),
+                     FakeResponse(PRINCIPAL_XML), FakeResponse(HOME_XML), FakeResponse(collections_xml("card")), FakeResponse(report_xml())])
+    server.requests.request = http
+    server.search_contacts()
+    server.search_contacts()
+    assert [c["method"] for c in http.calls].count("PROPFIND") == 6
+
+
+def test_failed_discovery_is_not_cached():
+    http = FakeHTTP([FakeResponse("", status_code=500),
+                     FakeResponse(PRINCIPAL_XML), FakeResponse(HOME_XML), FakeResponse(collections_xml("card")), FakeResponse(report_xml())])
+    server.requests.request = http
+    with pytest.raises(ToolError):
+        server.search_contacts()
+    assert server.search_contacts() == []
+
+
+def test_401_past_the_root_is_reported_as_throttling(monkeypatch):
+    monkeypatch.setattr(server, "CARDDAV_RETRY_DELAY", 0)
+    http = FakeHTTP([FakeResponse(PRINCIPAL_XML)] + [FakeResponse("", status_code=401)] * (server.CARDDAV_401_RETRIES + 1))
+    server.requests.request = http
+    with pytest.raises(ToolError, match="temporarily rejecting.*credentials were just accepted"):
+        server.search_contacts()
+
+
 def test_spurious_401_during_discovery_is_retried(monkeypatch):
     # Observed live: iCloud intermittently 401s a correctly authenticated PROPFIND.
     monkeypatch.setattr(server, "CARDDAV_RETRY_DELAY", 0)

@@ -145,9 +145,13 @@ fixtures include a card whose inline photo is deliberately undecodable, because 
   edit. `save(only_this_recurrence=False)` is deliberate: we hold the whole `.ics`, and the
   default would try to merge into a master. `load()` records the ETag, so the PUT carries
   `If-Match` and a 412 surfaces as `ETagMismatchError`.
-- **iCloud CardDAV intermittently returns an empty 401** to a correctly authenticated
-  discovery PROPFIND (seen on the principal URL, clearing within seconds). It also varies
-  between absolute partition-host hrefs and relative ones. `_carddav_propfind` retries a
-  401 a few times before treating it as an auth failure.
+- **iCloud CardDAV throttles the account's partition with empty 401s.** The root PROPFIND
+  (served by another partition) keeps answering, but everything under `/<dsid>/` returns
+  401 with no body, on every host, for minutes at a time (over 25 minutes once on
+  2026-09-08 after a day of probing). Each request is a fresh Basic-auth login to Apple, so
+  volume is the likely trigger. Mitigations: discovery is cached per process
+  (`_addressbook_cache`, one hour), a 401 past the root is reported as throttling rather
+  than bad credentials, and short retries are kept only for the seconds-long blips seen
+  earlier. Apple also varies between absolute partition-host hrefs and relative ones.
 - **Notes sync over CloudKit, not IMAP.** `search_notes` reaches only legacy IMAP notes and
   is empty for most accounts; an empty result is not evidence the user has no notes.

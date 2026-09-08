@@ -5,7 +5,8 @@ contact, runs update and delete on each, verifies every step by reading
 back, and checks the backups. Only the two items it creates are touched;
 on failure it still tries to remove them. Needs .env.
 
-    .venv/bin/python scripts/roundtrip_pim.py
+    .venv/bin/python scripts/roundtrip_pim.py              # both halves
+    .venv/bin/python scripts/roundtrip_pim.py --contacts   # or --calendar
 """
 
 import os
@@ -129,9 +130,12 @@ def cleanup():
 
 
 def main():
+    which = sys.argv[1:] or ["--calendar", "--contacts"]
     try:
-        calendar_round_trip()
-        contact_round_trip()
+        if "--calendar" in which:
+            calendar_round_trip()
+        if "--contacts" in which:
+            contact_round_trip()
     finally:
         cleanup()
     print("\nRound trip complete. Nothing created by this run remains on the account.")

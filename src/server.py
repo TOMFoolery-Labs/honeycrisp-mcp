@@ -1790,6 +1790,14 @@ def _carddav_propfind(url: str, depth: int, body: str, auth: HTTPBasicAuth) -> E
             break
         log.warning("CardDAV PROPFIND %s returned 401; retrying (%d/%d).", url, attempt + 1, CARDDAV_401_RETRIES)
         time.sleep(CARDDAV_RETRY_DELAY)
+    if response.status_code == 401 and url.rstrip("/") != CARDDAV_URL.rstrip("/"):
+        # The root answered with these same credentials a moment ago, so this
+        # is the partition throttling the account, not a bad password.
+        raise ToolError(
+            "iCloud is temporarily rejecting CardDAV requests for this account (HTTP 401 on "
+            f"{url}) even though the credentials were just accepted. This clears on its own, "
+            "typically within minutes; try again later."
+        )
     if response.status_code not in (200, 207):
         raise ToolError(f"CardDAV PROPFIND failed ({response.status_code}): {response.text[:200]}")
     return ET.fromstring(response.text)
@@ -1889,7 +1897,25 @@ def _addressbook_urls(auth: HTTPBasicAuth) -> List[str]:
     return [book["url"] for book in _addressbooks(auth)]
 
 
+# Discovery costs three authenticated PROPFINDs and its answer never changes
+# for an account in practice, so it is cached for the life of the process.
+# Every CardDAV request is a separate Basic-auth login as far as iCloud is
+# concerned, and the account's partition starts answering 401 for many
+# minutes once too many arrive (observed 2026-09-08), so fewer is safer.
+ADDRESSBOOK_CACHE_TTL = 3600
+_addressbook_cache: Dict[str, Any] = {"books": None, "expires": 0.0}
+
+
 def _addressbooks(auth: HTTPBasicAuth) -> List[Dict[str, str]]:
+    cached = _addressbook_cache["books"]
+    if cached is not None and time.time() < _addressbook_cache["expires"]:
+        return list(cached)
+    books = _discover_addressbooks(auth)
+    _addressbook_cache.update(books=list(books), expires=time.time() + ADDRESSBOOK_CACHE_TTL)
+    return books
+
+
+def _discover_addressbooks(auth: HTTPBasicAuth) -> List[Dict[str, str]]:
     """Discover every address book collection, with its display name.
 
     Apple redirects to partition hosts (e.g. p61-contacts.icloud.com) and
