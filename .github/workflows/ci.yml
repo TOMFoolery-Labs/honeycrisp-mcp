@@ -57,7 +57,7 @@ jobs:
           send({"jsonrpc": "2.0", "method": "notifications/initialized"})
           send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
           tools = recv(2)["result"]["tools"]
-          assert len(tools) == 20, len(tools)
+          assert len(tools) == 21, len(tools)
           p.stdin.close(); p.wait(timeout=10)
           print("handshake ok,", len(tools), "tools")
           PY

@@ -31,11 +31,11 @@ It never has credentials; anything needing the live account stays in `scripts/`.
 
 The round trips send real mail and write real data (on items they create and remove). Run
 them deliberately, and not back to back: CardDAV throttles the account after bursts (see
-below). All twenty tools passed these live on 2026-09-08.
+below). All tools passed these live on 2026-09-08.
 
 ## Architecture
 
-One module, `src/server.py`, exposing twenty FastMCP tools over four protocols: IMAP for mail
+One module, `src/server.py`, exposing twenty-one FastMCP tools over four protocols: IMAP for mail
 and legacy notes, SMTP (stdlib `smtplib`, STARTTLS on 587) for sending, CalDAV (via the
 `caldav` lib) for calendar, and raw CardDAV over `requests` for contacts. `tests/fakes.py`
 provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` for fakes.
@@ -120,6 +120,12 @@ IMAP after delivery. That step runs after the message has left, so it logs and r
 `saved_to_sent: False` rather than raising. Bcc recipients go only in the SMTP envelope.
 Replies (`reply_to_id`) fetch only the threading headers of the original via
 `HEADER.FIELDS`, read-only and with PEEK, so replying never marks the original as read.
+
+**`save_attachments` is the only tool that writes outside `backups/`.** Destination defaults
+to `DOWNLOAD_DIR` (`~/Downloads/Honeycrisp`, or `HONEYCRISP_DOWNLOAD_DIR`); the caller may
+name any directory, but attachment filenames go through `_safe_filename` (basename only,
+separators and control characters stripped) so a hostile `Content-Disposition` cannot
+traverse out of it, and `_unique_path` suffixes rather than overwrites by default.
 
 **Body text goes through `_message_text`.** Both `search_emails` previews and `get_email`
 use it: text/plain preferred, otherwise HTML converted with `_html_to_text`, which drops

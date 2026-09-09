@@ -3,7 +3,7 @@
 [![CI](https://github.com/TOMFoolery-Labs/honeycrisp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TOMFoolery-Labs/honeycrisp-mcp/actions/workflows/ci.yml)
 
 A Model Context Protocol (MCP) server for iCloud — Mail, Calendar, Contacts and Notes —
-using an Apple app-specific password. Twenty tools: read, search, send, edit and delete,
+using an Apple app-specific password. Twenty-one tools: read, search, send, edit and delete,
 every write previewed by default. All of them are verified against a real account.
 
 It talks to the open protocols Apple supports (IMAP and SMTP for mail, CalDAV for calendar,
@@ -93,6 +93,7 @@ Checkout:
 | `list_folders()` | Every mail folder with its role (inbox, sent, trash, ...) and message and unseen counts. |
 | `search_emails(folder, limit, sender, to, subject, text, since, before, unread, flagged, query)` | Search a mail folder with structured filters (ANDed) or, as an escape hatch, raw IMAP `query`. Returns sender, subject, date, flags and a decoded preview, newest first. |
 | `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
+| `save_attachments(message_id, folder, filenames, directory, overwrite)` | Write a message's attachments to disk (default `~/Downloads/Honeycrisp`), never overwriting unless asked. |
 | `list_calendars()` | Every calendar with its kind (events or reminders), writability, sharing and colour. |
 | `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. Each carries an `id` for `update_event` and `delete_event`. |
 | `list_addressbooks()` | Every address book, for `create_contact`. |
@@ -218,7 +219,9 @@ tools. See [Apple's note](https://support.apple.com/HT210220).
   (`PREVIEW_FETCH_BYTES`), using `BODY.PEEK` so mail is never marked read, and the text is
   MIME-decoded before truncation to 500 characters. `get_email` fetches the whole message,
   still with `BODY.PEEK`, and caps the returned body at `max_chars` (20,000 by default).
-  Attachments are listed but never downloaded.
+  Attachments are listed, and `save_attachments` writes them to disk on request; declared
+  filenames are reduced to a single safe path component so an attachment can never land
+  outside the chosen directory.
 - **The IMAP connection is cached** across tool calls and re-established when stale, because
   iCloud caps concurrent connections and throttles repeated logins. Access is serialised
   with a lock, as `IMAPClient` is not thread-safe. CardDAV discovery is cached too, for the

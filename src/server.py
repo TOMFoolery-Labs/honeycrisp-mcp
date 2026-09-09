@@ -96,6 +96,9 @@ def _default_backup_dir(source_root: str) -> str:
 
 BACKUP_DIR = os.getenv("HONEYCRISP_BACKUP_DIR") or _default_backup_dir(PROJECT_ROOT)
 
+# Where save_attachments puts files unless told otherwise.
+DOWNLOAD_DIR = os.getenv("HONEYCRISP_DOWNLOAD_DIR") or os.path.join(os.path.expanduser("~"), "Downloads", "Honeycrisp")
+
 if not ICLOUD_EMAIL or not ICLOUD_APP_PASSWORD:
     log.warning("ICLOUD_EMAIL and ICLOUD_APP_PASSWORD must be set in the environment.")
 
@@ -109,8 +112,9 @@ Honeycrisp gives you the user's iCloud account: Mail (IMAP/SMTP), Calendar and \
 Reminders lists (CalDAV) and Contacts (CardDAV).
 
 Mail: list_folders shows folder names; search_emails finds messages with structured \
-filters (sender, subject, since, unread, ...); get_email returns one in full. Message ids \
-are specific to the folder they were found in. send_email (with reply_to_id for replies), \
+filters (sender, subject, since, unread, ...); get_email returns one in full and lists its \
+attachments, which save_attachments writes to disk. Message ids are specific to the folder \
+they were found in. send_email (with reply_to_id for replies), \
 forward_email, mark_emails, move_emails and delete_emails change the mailbox. delete_emails \
 moves to Trash unless permanent=True.
 
@@ -1157,6 +1161,102 @@ def forward_email(
         return result
     result.update(_deliver(message, address, to_list + cc_list + bcc_list))
     return result
+
+
+_UNSAFE_FILENAME_RE = re.compile(r"[\\/:\x00-\x1f]")
+
+
+def _safe_filename(name: str, index: int) -> str:
+    """Reduce an attachment's declared name to a single safe path component."""
+    base = os.path.basename((name or "").replace("\\", "/").strip())
+    base = _UNSAFE_FILENAME_RE.sub("_", base).strip(" .")
+    return base or f"attachment-{index}"
+
+
+def _unique_path(directory: str, filename: str) -> str:
+    stem, ext = os.path.splitext(filename)
+    candidate = os.path.join(directory, filename)
+    n = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{stem} ({n}){ext}")
+        n += 1
+    return candidate
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+def save_attachments(
+    message_id: str,
+    folder: str = "INBOX",
+    filenames: Optional[List[str]] = None,
+    directory: Optional[str] = None,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """
+    Save an email's attachments to disk so they can be opened or read.
+
+    Writes only local files; the mailbox is untouched and the message is not
+    marked as read. Existing files are never replaced unless overwrite=True;
+    a numeric suffix is added instead.
+
+    Args:
+        message_id: The 'id' from search_emails.
+        folder: Folder the message lives in (default 'INBOX').
+        filenames: Save only these attachments (names as listed by get_email).
+            Default saves all of them.
+        directory: Destination directory. Defaults to ~/Downloads/Honeycrisp
+            (or HONEYCRISP_DOWNLOAD_DIR). Created if missing.
+        overwrite: Replace an existing file of the same name.
+    """
+    uid = _parse_message_ids([message_id])[0]
+    target_dir = os.path.abspath(os.path.expanduser(directory.strip())) if directory and directory.strip() else DOWNLOAD_DIR
+    wanted = {n.strip() for n in filenames or [] if n and n.strip()}
+    if filenames is not None and not wanted:
+        raise ToolError("filenames was given but contained no usable names; omit it to save everything.")
+
+    with imap_session() as client:
+        try:
+            client.select_folder(folder, readonly=True)
+        except Exception as e:
+            raise ToolError(f"Could not open folder {folder!r}: {e}") from e
+        raw = _fetch_raw_message(client, uid, folder, ["BODY.PEEK[]"])
+    message = email.message_from_bytes(raw, policy=email.policy.default)
+
+    parts = _iter_attachments(message)
+    available = [p.get_filename() or "" for p in parts]
+    if wanted:
+        missing = sorted(wanted - set(available))
+        if missing:
+            raise ToolError(
+                f"No attachment named {', '.join(map(repr, missing))} on message {uid}. "
+                f"Available: {', '.join(map(repr, available)) or 'none'}."
+            )
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as e:
+        raise ToolError(f"Could not create directory {target_dir!r}: {e}") from e
+
+    saved = []
+    for index, part in enumerate(parts, start=1):
+        declared = part.get_filename() or ""
+        if wanted and declared not in wanted:
+            continue
+        try:
+            payload = part.get_payload(decode=True) or b""
+        except Exception as e:
+            raise ToolError(f"Could not decode attachment {declared!r}: {e}") from e
+        filename = _safe_filename(declared, index)
+        path = os.path.join(target_dir, filename) if overwrite else _unique_path(target_dir, filename)
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        saved.append({
+            "filename": declared,
+            "path": path,
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+        })
+
+    return {"id": str(uid), "folder": folder, "directory": target_dir, "saved": saved}
 
 
 def _iter_attachments(message: Any) -> List[Any]:
