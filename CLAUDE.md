@@ -42,7 +42,9 @@ provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` 
 
 **CardDAV is hand-rolled** and has the most structure. `_addressbooks` (cached) →
 `_fetch_cards` → `_put_card` / `_create_card` / `_delete_card` is the shared transport;
-every contact tool goes through it. `_fetch_cards` returns `Card(url, etag, raw)` — the
+every contact tool goes through it. PROPFIND and REPORT both go through `_carddav_request`,
+which raises on anything but 2xx: a failed address book must never contribute an empty
+result, because that reads as "no contacts" or "no contact found" to the model. `_fetch_cards` returns `Card(url, etag, raw)` — the
 ETag is what makes safe writes possible. Read and write paths share this layer, so changes
 to discovery affect both. Tests replace `requests.request` with `tests/fakes.py:FakeHTTP`.
 
@@ -52,7 +54,9 @@ the same way, because iCloud 412s the library's by-UID REPORT. `list_calendars` 
 raw PROPFIND per calendar. Tests replace `get_caldav_client` with fakes.
 
 **Mail sending** is `_deliver`: SMTP send, then an IMAP APPEND to Sent. `send_email` and
-`forward_email` both use it.
+`forward_email` both use it. `smtplib` raises only when every recipient is refused; a
+partial refusal comes back as a dict, which `_deliver` reports as `refused` next to
+`sent: True`.
 
 **IMAP connections are cached** module-globally (`_imap_client`) behind `_imap_lock`, because
 iCloud caps concurrent connections and throttles repeated logins. `imap_session()` probes
@@ -76,6 +80,11 @@ so imapclient does the quoting and IMAP date formatting; the only string path is
 `query` escape hatch, which cannot be mixed with the filters because a raw string inside a
 list gets quoted as one literal. Non-ASCII values set `charset="UTF-8"`, which iCloud
 accepts (verified 2026-09-08).
+
+**Contact summaries must not raise after a write.** `_summarise` goes through vobject,
+which rejects some real cards (undecodable inline photo). `search_contacts` and
+`update_contact` use `_summarise_safely`, which falls back to `_summarise_from_lines`, and
+`update_contact` builds both summaries before the PUT so nothing can fail afterwards.
 
 **Tools raise `ToolError`; they never return error-shaped data.** Returning `[{"error": ...}]`
 gives a model something it will mistake for a result. Relatedly, never silently fall back to

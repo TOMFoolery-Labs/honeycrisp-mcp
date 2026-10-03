@@ -141,6 +141,9 @@ Mail:
 - **Sent mail is filed.** iCloud's SMTP server does not save outgoing mail, so `send_email`
   appends a copy to the Sent folder after delivery, the same way Mail.app does. If that step
   fails the message has still gone out; the result says `saved_to_sent: false`.
+- **Partial refusals are reported.** When the SMTP server accepts some recipients and turns
+  others away, the message goes to the accepted ones and the result's `refused` maps each
+  rejected address to the server's reason. It is empty on a clean send.
 
 Calendar:
 
@@ -189,7 +192,8 @@ strip the suffix and log a warning; `repair_contacts` splits it back onto its ow
 request for the account with an empty HTTP 401 for several minutes, even though the
 credentials are fine. The server reports this as temporary throttling rather than an
 authentication failure, and caches address-book discovery for an hour so routine use makes
-one request per call instead of four. If you see it, wait a few minutes.
+one request per call instead of four. A throttled request raises; it never comes back as an
+empty search or a "no contact found". If you see it, wait a few minutes.
 
 **Notes.** Notes created in the modern Notes app sync over CloudKit, not IMAP, and are not
 reachable here. `search_notes` sees only notes stored on the IMAP account, which for most

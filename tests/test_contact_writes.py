@@ -153,6 +153,15 @@ def test_delete_of_a_card_changed_elsewhere_is_refused():
         server.delete_contact("UID-DANA", dry_run=False)
 
 
+def test_delete_during_throttling_reports_throttling_not_a_missing_contact(monkeypatch):
+    monkeypatch.setattr(server, "CARDDAV_RETRY_DELAY", 0)
+    http = install(FakeResponse(collections_xml("card")),
+                   *[FakeResponse("", status_code=401)] * (server.CARDDAV_401_RETRIES + 1))
+    with pytest.raises(ToolError, match="temporarily rejecting"):
+        server.delete_contact("uid-Ann", dry_run=False)
+    assert http.deletes == []
+
+
 def test_delete_unknown_id_raises():
     http = install(FakeResponse(collections_xml("card")), FakeResponse(report_xml(CARD)))
     with pytest.raises(ToolError, match="No contact found with id 'nope'"):
