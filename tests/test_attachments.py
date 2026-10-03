@@ -19,8 +19,9 @@ def reset_imap_cache():
 
 @pytest.fixture(autouse=True)
 def default_download_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "DOWNLOAD_DIR", str(tmp_path / "default"))
-    return tmp_path / "default"
+    # The download folder is the sandbox: every test directory below sits inside it.
+    monkeypatch.setattr(server, "DOWNLOAD_DIR", str(tmp_path))
+    return tmp_path
 
 
 PDF = b"%PDF-1.4 fake"
@@ -69,6 +70,34 @@ def test_filenames_filter_and_explicit_directory(tmp_path):
     result = server.save_attachments("5", filenames=["chart.png"], directory=str(tmp_path / "out"))
     assert [s["filename"] for s in result["saved"]] == ["chart.png"]
     assert os.listdir(tmp_path / "out") == ["chart.png"]
+
+
+def test_relative_directory_is_a_subfolder_of_the_download_folder(tmp_path):
+    use(TWO)
+    result = server.save_attachments("5", filenames=["chart.png"], directory="invoices/2026")
+    assert result["directory"] == str(tmp_path / "invoices" / "2026")
+    assert (tmp_path / "invoices" / "2026" / "chart.png").exists()
+
+
+@pytest.mark.parametrize("escape", ["..", "../elsewhere", "{abs}/../outside", "/etc", "~/.ssh"])
+def test_directories_outside_the_download_folder_are_refused(tmp_path, monkeypatch, escape):
+    # Mail is hostile input; a model can be talked into "saving" an attachment
+    # over a dotfile. Writes are confined to the download folder.
+    monkeypatch.setenv("HOME", str(tmp_path.parent))
+    use(TWO)
+    with pytest.raises(ToolError, match="outside the download folder"):
+        server.save_attachments("5", directory=escape.format(abs=tmp_path))
+    assert list(tmp_path.iterdir()) == [], "nothing written"
+
+
+def test_symlink_inside_the_folder_cannot_point_out_of_it(tmp_path):
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "link").symlink_to(outside)
+    use(TWO)
+    with pytest.raises(ToolError, match="outside the download folder"):
+        server.save_attachments("5", directory="link")
+    assert not list(outside.iterdir())
 
 
 def test_unknown_filename_lists_what_is_available(tmp_path):

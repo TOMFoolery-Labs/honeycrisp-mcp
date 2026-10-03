@@ -93,7 +93,7 @@ Checkout:
 | `list_folders()` | Every mail folder with its role (inbox, sent, trash, ...) and message and unseen counts. |
 | `search_emails(folder, limit, sender, to, subject, text, since, before, unread, flagged, query)` | Search a mail folder with structured filters (ANDed) or, as an escape hatch, raw IMAP `query`. Returns sender, subject, date, flags and a decoded preview, newest first. |
 | `get_email(message_id, folder, max_chars)` | One message in full: headers, decoded body (HTML converted to text), attachment names and sizes. |
-| `save_attachments(message_id, folder, filenames, directory, overwrite)` | Write a message's attachments to disk (default `~/Downloads/Honeycrisp`), never overwriting unless asked. |
+| `save_attachments(message_id, folder, filenames, directory, overwrite)` | Write a message's attachments into the download folder (`~/Downloads/Honeycrisp`) or a folder beneath it, never overwriting unless asked. |
 | `list_calendars()` | Every calendar with its kind (events or reminders), writability, sharing and colour. |
 | `get_calendar_events(start_date, end_date, limit)` | Events across all calendars in a date range, recurrences expanded, sorted by start time. Each carries an `id` for `update_event` and `delete_event`. |
 | `list_addressbooks()` | Every address book, for `create_contact`. |
@@ -151,7 +151,9 @@ Calendar:
   rather than guessing. Naive times are treated as UTC, so pass an offset for local times.
   All-day events take dates, with `end` being the day after the last day.
 - **Edits preserve the rest.** `update_event` changes only the fields you pass; alarms,
-  attendees, recurrence rules, time zones and custom properties survive. Passing `start`
+  attendees, recurrence rules, time zones and custom properties survive. A new time is
+  written in the zone the event already uses, so a series anchored in, say,
+  `America/Chicago` keeps following that zone's DST changes. Passing `start`
   alone moves the event and keeps its duration. For a recurring event the change applies to
   the series. The save carries an `If-Match` ETag, so a concurrent edit is refused.
 - **Backups.** `update_event` and `delete_event` save the event's iCalendar text to
@@ -223,15 +225,20 @@ tools. See [Apple's note](https://support.apple.com/HT210220).
   (`PREVIEW_FETCH_BYTES`), using `BODY.PEEK` so mail is never marked read, and the text is
   MIME-decoded before truncation to 500 characters. `get_email` fetches the whole message,
   still with `BODY.PEEK`, and caps the returned body at `max_chars` (20,000 by default).
-  Attachments are listed, and `save_attachments` writes them to disk on request; declared
-  filenames are reduced to a single safe path component so an attachment can never land
-  outside the chosen directory.
+  Attachments are listed, and `save_attachments` writes them to disk on request. Writes are
+  confined to the download folder (`HONEYCRISP_DOWNLOAD_DIR`, default `~/Downloads/Honeycrisp`)
+  and folders beneath it, with symlinks resolved first, and declared filenames are reduced
+  to a single safe path component. Mail is untrusted input, so neither a hostile message
+  nor a misled model can land a file anywhere else.
 - **The IMAP connection is cached** across tool calls and re-established when stale, because
   iCloud caps concurrent connections and throttles repeated logins. Access is serialised
   with a lock, as `IMAPClient` is not thread-safe. CardDAV discovery is cached too, for the
   same reason.
 - **Event lookups go by URL.** iCloud rejects the CalDAV query-by-UID report, so events are
   fetched at `<calendar>/<UID>.ics`, with the report kept as a fallback for other servers.
+  Single-contact lookups (`update_contact`, `delete_contact`) do the same with
+  `<addressbook>/<UID>.vcf`, so editing one contact no longer downloads the whole address
+  book; the full `REPORT` remains the fallback for cards stored under another name.
 - **Diagnostics go to stderr.** This is a stdio server, so stdout carries the JSON-RPC
   stream exclusively. Set `HONEYCRISP_LOG_LEVEL=DEBUG` for more detail.
 

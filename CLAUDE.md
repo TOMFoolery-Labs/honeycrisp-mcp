@@ -44,7 +44,12 @@ provides stand-ins for all four; tests swap `_connect_imap` and `_connect_smtp` 
 `_fetch_cards` → `_put_card` / `_create_card` / `_delete_card` is the shared transport;
 every contact tool goes through it. PROPFIND and REPORT both go through `_carddav_request`,
 which raises on anything but 2xx: a failed address book must never contribute an empty
-result, because that reads as "no contacts" or "no contact found" to the model. `_fetch_cards` returns `Card(url, etag, raw)` — the
+result, because that reads as "no contacts" or "no contact found" to the model.
+`update_contact` and `delete_contact` locate their card with `_find_card`: a direct GET of
+`<addressbook>/<UID>.vcf` per book (the URL `create_contact` writes to), falling back to
+the full REPORT only when no book serves the card there. The direct path was added
+2026-10-03 and has not yet been run live; `scripts/roundtrip_pim.py --contacts` exercises
+it, and the fallback keeps behaviour correct if iCloud ever lays a card out differently. `_fetch_cards` returns `Card(url, etag, raw)` — the
 ETag is what makes safe writes possible. Read and write paths share this layer, so changes
 to discovery affect both. Tests replace `requests.request` with `tests/fakes.py:FakeHTTP`.
 
@@ -130,11 +135,14 @@ IMAP after delivery. That step runs after the message has left, so it logs and r
 Replies (`reply_to_id`) fetch only the threading headers of the original via
 `HEADER.FIELDS`, read-only and with PEEK, so replying never marks the original as read.
 
-**`save_attachments` is the only tool that writes outside `backups/`.** Destination defaults
-to `DOWNLOAD_DIR` (`~/Downloads/Honeycrisp`, or `HONEYCRISP_DOWNLOAD_DIR`); the caller may
-name any directory, but attachment filenames go through `_safe_filename` (basename only,
-separators and control characters stripped) so a hostile `Content-Disposition` cannot
-traverse out of it, and `_unique_path` suffixes rather than overwrites by default.
+**`save_attachments` is the only tool that writes outside `backups/`, and only under
+`DOWNLOAD_DIR`** (`~/Downloads/Honeycrisp`, or `HONEYCRISP_DOWNLOAD_DIR`). `directory` is
+resolved by `_resolve_download_dir` (relative to that folder, `realpath` for symlinks, then
+a `commonpath` check) and anything outside raises. Mail is hostile input: without this a
+model talked into "saving" an attachment over `~/.ssh/authorized_keys` would have a
+write-anywhere primitive. Filenames go through `_safe_filename` (basename only, separators
+and control characters stripped), and `_unique_path` suffixes rather than overwrites by
+default.
 
 **Body text goes through `_message_text`.** Both `search_emails` previews and `get_email`
 use it: text/plain preferred, otherwise HTML converted with `_html_to_text`, which drops
@@ -186,6 +194,11 @@ fixtures include a card whose inline photo is deliberately undecodable, because 
   reminders?". Real reminders sync over CloudKit since the 2019 upgrade; a VTODO written
   here never appears in the app. Also, `calendar.todos()` (which filters on completion) gets
   a 500 from iCloud, while `search(todo=True, include_completed=True)` works.
+- **`update_event` writes a new time in the event's own zone.** `_set_time` converts the
+  value into the zone of the time it replaces (`DTSTART;TZID=America/Chicago:...`) and
+  only falls back to UTC for events stored in UTC or as floating times. Writing UTC for a
+  series anchored in a named zone pins it to one offset and shifts every occurrence by an
+  hour across DST; a test pins the TZID form.
 - **`update_event` edits through `event.icalendar_instance`**, never by re-serialising
   from vobject. Reading `event.data` first captures the raw bytes for the backup; touching
   the icalendar instance afterwards clears the cached raw data so `save()` serialises the
