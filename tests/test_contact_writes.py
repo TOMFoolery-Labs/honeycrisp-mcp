@@ -162,6 +162,23 @@ def test_delete_during_throttling_reports_throttling_not_a_missing_contact(monke
     assert http.deletes == []
 
 
+def test_throttled_direct_get_is_reported_as_throttling():
+    http = install(FakeResponse(collections_xml("card")),
+                   cards={"UID-DANA.vcf": FakeResponse("", status_code=401)})
+    with pytest.raises(ToolError, match="temporarily rejecting"):
+        server.delete_contact("UID-DANA", dry_run=False)
+    assert http.deletes == []
+
+
+def test_delete_by_direct_get_carries_that_response_etag(isolate_backups):
+    http = install(FakeResponse(collections_xml("card")),
+                   cards={"UID-DANA.vcf": FakeResponse(CARD, status_code=200, headers={"ETag": '"from-get"'})})
+    result = server.delete_contact("UID-DANA", dry_run=False)
+    assert result["deleted"] is True
+    assert [c["method"] for c in http.calls].count("REPORT") == 0
+    assert http.deletes == [{"url": http.calls[-2]["url"], "if_match": '"from-get"'}]
+
+
 def test_delete_unknown_id_raises():
     http = install(FakeResponse(collections_xml("card")), FakeResponse(report_xml(CARD)))
     with pytest.raises(ToolError, match="No contact found with id 'nope'"):

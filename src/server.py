@@ -27,7 +27,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, getaddresses, make_msgid, parsedate_to_datetime
 from html import unescape as html_unescape
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import quote as url_quote, urljoin
 from xml.sax.saxutils import escape as xml_escape
 
 import caldav
@@ -99,6 +99,30 @@ BACKUP_DIR = os.getenv("HONEYCRISP_BACKUP_DIR") or _default_backup_dir(PROJECT_R
 # Where save_attachments puts files unless told otherwise.
 DOWNLOAD_DIR = os.getenv("HONEYCRISP_DOWNLOAD_DIR") or os.path.join(os.path.expanduser("~"), "Downloads", "Honeycrisp")
 
+
+def _resolve_download_dir(directory: Optional[str]) -> str:
+    """Resolve the caller's directory to a path inside DOWNLOAD_DIR, or raise.
+
+    Mail is untrusted input, and a model reading a hostile message could be
+    told to drop an attachment into ~/.ssh or a shell profile. Confining
+    writes to the download folder (set with HONEYCRISP_DOWNLOAD_DIR) turns
+    that into a file in Downloads at worst. Symlinks are resolved before the
+    check so a link inside the folder cannot point out of it.
+    """
+    root = os.path.realpath(os.path.expanduser(DOWNLOAD_DIR))
+    text = (directory or "").strip()
+    if not text:
+        return root
+    text = os.path.expanduser(text)
+    target = os.path.realpath(text if os.path.isabs(text) else os.path.join(root, text))
+    if target != root and os.path.commonpath([root, target]) != root:
+        raise ToolError(
+            f"directory {directory!r} is outside the download folder {root!r}. Attachments are "
+            "only written there or in a folder beneath it; set HONEYCRISP_DOWNLOAD_DIR to "
+            "move the folder."
+        )
+    return target
+
 if not ICLOUD_EMAIL or not ICLOUD_APP_PASSWORD:
     log.warning("ICLOUD_EMAIL and ICLOUD_APP_PASSWORD must be set in the environment.")
 
@@ -113,7 +137,8 @@ Reminders lists (CalDAV) and Contacts (CardDAV).
 
 Mail: list_folders shows folder names; search_emails finds messages with structured \
 filters (sender, subject, since, unread, ...); get_email returns one in full and lists its \
-attachments, which save_attachments writes to disk. Message ids are specific to the folder \
+attachments, which save_attachments writes to the download folder (or a folder beneath it; \
+nowhere else). Message ids are specific to the folder \
 they were found in. send_email (with reply_to_id for replies), \
 forward_email, mark_emails, move_emails and delete_emails change the mailbox. delete_emails \
 moves to Trash unless permanent=True. After a send, check 'refused': a non-empty value means \
@@ -1223,19 +1248,22 @@ def save_attachments(
 
     Writes only local files; the mailbox is untouched and the message is not
     marked as read. Existing files are never replaced unless overwrite=True;
-    a numeric suffix is added instead.
+    a numeric suffix is added instead. Files only ever land in the download
+    folder or a folder beneath it.
 
     Args:
         message_id: The 'id' from search_emails.
         folder: Folder the message lives in (default 'INBOX').
         filenames: Save only these attachments (names as listed by get_email).
             Default saves all of them.
-        directory: Destination directory. Defaults to ~/Downloads/Honeycrisp
-            (or HONEYCRISP_DOWNLOAD_DIR). Created if missing.
+        directory: Destination, as a folder name relative to the download
+            folder (e.g. 'invoices/2026') or an absolute path inside it.
+            Defaults to the download folder itself: ~/Downloads/Honeycrisp,
+            or HONEYCRISP_DOWNLOAD_DIR. Created if missing.
         overwrite: Replace an existing file of the same name.
     """
     uid = _parse_message_ids([message_id])[0]
-    target_dir = os.path.abspath(os.path.expanduser(directory.strip())) if directory and directory.strip() else DOWNLOAD_DIR
+    target_dir = _resolve_download_dir(directory)
     wanted = {n.strip() for n in filenames or [] if n and n.strip()}
     if filenames is not None and not wanted:
         raise ToolError("filenames was given but contained no usable names; omit it to save everything.")
@@ -1628,10 +1656,25 @@ def _component_summary(comp: Any) -> Dict[str, Any]:
     }
 
 
-def _set_time(comp: Any, prop: str, value: Any) -> None:
+def _zone_name(value: Any) -> str:
+    """IANA name of a datetime's zone ('' for UTC, fixed offsets, dates and floating times)."""
+    tz = value.tzinfo if isinstance(value, datetime) else None
+    name = getattr(tz, "key", None) or getattr(tz, "zone", None) or ""
+    return "" if name.upper() in ("UTC", "ETC/UTC") else name
+
+
+def _set_time(comp: Any, prop: str, value: Any, previous: Any) -> None:
+    """Write DTSTART/DTEND, keeping the zone the event already used.
+
+    A series anchored in a named zone (DTSTART;TZID=America/Chicago) must stay
+    in it: rewriting it as UTC would pin every occurrence to one offset and
+    shift the whole series by an hour across a DST change. Events stored in
+    UTC, or as floating times, are written in UTC as before.
+    """
     comp.pop(prop, None)
     if isinstance(value, datetime):
-        value = value.astimezone(timezone.utc)
+        zone = _zone_name(previous)
+        value = value.astimezone(previous.tzinfo) if zone else value.astimezone(timezone.utc)
     comp.add(prop, value)
 
 
@@ -1656,7 +1699,9 @@ def update_event(
     or description to remove it.
 
     Times follow create_event: ISO 8601, naive values treated as UTC, and
-    dates (YYYY-MM-DD) for an all-day event.
+    dates (YYYY-MM-DD) for an all-day event. A new time is stored in the
+    zone the event already uses, so a series keeps following that zone's
+    DST changes.
 
     Args:
         event_id: The 'id' from get_calendar_events.
@@ -1700,11 +1745,11 @@ def update_event(
     if new_end <= new_start:
         raise ToolError(f"end ({new_end.isoformat()}) must be after start ({new_start.isoformat()}).")
     if new_start != old_start:
-        _set_time(comp, "DTSTART", new_start)
+        _set_time(comp, "DTSTART", new_start, old_start)
         changes.append(f"start: {old_start.isoformat()} -> {new_start.isoformat()}")
     if new_end != old_end or (start and "DURATION" in comp):
         comp.pop("DURATION", None)
-        _set_time(comp, "DTEND", new_end)
+        _set_time(comp, "DTEND", new_end, old_end)
         if new_end != old_end:
             changes.append(f"end: {old_end.isoformat()} -> {new_end.isoformat()}")
 
@@ -1908,6 +1953,15 @@ CARDDAV_401_RETRIES = 3
 CARDDAV_RETRY_DELAY = 1.5
 
 
+def _throttled(url: str) -> ToolError:
+    """The error for a 401 past the root: partition throttling, not a bad password."""
+    return ToolError(
+        "iCloud is temporarily rejecting CardDAV requests for this account (HTTP 401 on "
+        f"{url}) even though the credentials were just accepted. This clears on its own, "
+        "typically within minutes; try again later."
+    )
+
+
 def _carddav_request(method: str, url: str, depth: int, body: str, auth: HTTPBasicAuth) -> requests.Response:
     """Issue one CardDAV request (PROPFIND or REPORT) and return its 2xx response.
 
@@ -1931,11 +1985,7 @@ def _carddav_request(method: str, url: str, depth: int, body: str, auth: HTTPBas
         # cached), so this is the partition throttling the account, not a bad
         # password. Discovery is re-run once the cache expires, and a genuinely
         # bad password is reported from there.
-        raise ToolError(
-            "iCloud is temporarily rejecting CardDAV requests for this account (HTTP 401 on "
-            f"{url}) even though the credentials were just accepted. This clears on its own, "
-            "typically within minutes; try again later."
-        )
+        raise _throttled(url)
     if response.status_code not in (200, 207):
         raise ToolError(f"CardDAV {method} failed ({response.status_code}): {response.text[:200]}")
     return response
@@ -2172,6 +2222,39 @@ def _fetch_cards(auth: HTTPBasicAuth, query: str = "") -> List[Card]:
                 raw=data.text,
             ))
     return cards
+
+
+def _card_url(addressbook_url: str, uid: str) -> str:
+    return urljoin(addressbook_url, url_quote(uid, safe="") + ".vcf")
+
+
+def _get_card(auth: HTTPBasicAuth, url: str) -> Optional[Card]:
+    """GET one card by URL. None on 404 or on an answer that is not a usable card."""
+    response = requests.request("GET", url, auth=auth, timeout=HTTP_TIMEOUT)
+    if response.status_code == 404:
+        return None
+    if response.status_code == 401:
+        raise _throttled(url)
+    if response.status_code != 200 or not _is_vcard(response.text):
+        log.warning("GET %s answered %s without a card; falling back to a REPORT.", url, response.status_code)
+        return None
+    return Card(url=url, etag=response.headers.get("ETag", ""), raw=response.text)
+
+
+def _find_card(auth: HTTPBasicAuth, uid: str) -> Optional[Card]:
+    """Locate one contact by UID without pulling every card down.
+
+    iCloud stores each card at <addressbook>/<UID>.vcf (the URL create_contact
+    writes to), so a direct GET per address book finds it in one small
+    request. The REPORT over the whole book, photos and all, is kept only as
+    the fallback for cards whose URL does not follow that pattern. Fewer and
+    smaller requests matter here: volume is what trips the partition throttle.
+    """
+    for book_url in _addressbook_urls(auth):
+        card = _get_card(auth, _card_url(book_url, uid))
+        if card is not None and _card_uid(card.raw) == uid:
+            return card
+    return next((c for c in _fetch_cards(auth) if _card_uid(c.raw) == uid), None)
 
 
 def _put_card(auth: HTTPBasicAuth, card: Card, new_text: str) -> None:
@@ -2532,7 +2615,7 @@ def update_contact(
     address, password = _require_credentials()
     auth = HTTPBasicAuth(address, password)
 
-    match = next((c for c in _fetch_cards(auth) if _card_uid(c.raw) == contact_id.strip()), None)
+    match = _find_card(auth, contact_id.strip())
     if match is None:
         raise ToolError(f"No contact found with id {contact_id!r}.")
 
@@ -2745,7 +2828,7 @@ def create_contact(
     auth = HTTPBasicAuth(address, password)
     book = _pick_addressbook(_addressbook_urls(auth), addressbook)
     uid, text = _build_vcard(name, phones, emails, organization)
-    url = urljoin(book, f"{uid}.vcf")
+    url = _card_url(book, uid)
 
     if not dry_run:
         _create_card(auth, url, text)
@@ -2777,7 +2860,7 @@ def delete_contact(contact_id: str, dry_run: bool = True) -> Dict[str, Any]:
 
     address, password = _require_credentials()
     auth = HTTPBasicAuth(address, password)
-    match = next((c for c in _fetch_cards(auth) if _card_uid(c.raw) == uid), None)
+    match = _find_card(auth, uid)
     if match is None:
         raise ToolError(f"No contact found with id {uid!r}.")
 

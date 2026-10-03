@@ -20,9 +20,8 @@ CORRUPT = (
 )
 
 
-def install(*extra, put_status=204):
-    http = FakeHTTP([FakeResponse(PRINCIPAL_XML), FakeResponse(HOME_XML), *extra],
-                    put_status=put_status)
+def install(*extra, **kwargs):
+    http = FakeHTTP([FakeResponse(PRINCIPAL_XML), FakeResponse(HOME_XML), *extra], **kwargs)
     server.requests.request = http
     return http
 
@@ -193,6 +192,46 @@ def test_replacing_phones_keeps_type_labels_on_retained_numbers():
     assert "TEL;type=CELL;type=pref:555-1111\r\n" in body   # kept, params intact
     assert "555-9999" not in body                            # dropped
     assert "TEL:555-3333\r\n" in body                        # added
+
+
+def test_update_finds_the_card_by_direct_get_and_skips_the_report():
+    # iCloud serves every card at <book>/<UID>.vcf, so one small GET replaces
+    # a REPORT that would pull the whole address book (photos included) down.
+    http = install(FakeResponse(collections_xml("card")),
+                   cards={"U1.vcf": FakeResponse(CARD, status_code=200, headers={"ETag": '"etag-1"'})})
+    server.update_contact("U1", name="Ann Smith-Jones", dry_run=False)
+    assert [c["method"] for c in http.calls].count("REPORT") == 0
+    [get] = [c for c in http.calls if c["method"] == "GET"]
+    assert get["url"].endswith("/card/U1.vcf")
+    [write] = http.writes
+    assert write["url"].endswith("/card/U1.vcf") and write["if_match"] == '"etag-1"'
+    assert "FN:Ann Smith-Jones\r\n" in write["body"]
+
+
+def test_update_falls_back_to_the_report_when_the_url_does_not_match():
+    # A card stored under some other file name (another client's choice) is
+    # still found, just the slow way.
+    http = install(FakeResponse(collections_xml("card")), FakeResponse(report_xml(CARD)))
+    server.update_contact("U1", name="Ann Smith-Jones", dry_run=False)
+    methods = [c["method"] for c in http.calls]
+    assert methods.count("GET") == 1 and methods.count("REPORT") == 1
+    assert http.writes[0]["url"].endswith("/card/0.vcf")
+
+
+def test_direct_get_that_returns_the_wrong_card_is_not_trusted():
+    other = vcard("Someone Else", uid="U9")
+    http = install(FakeResponse(collections_xml("card")), FakeResponse(report_xml(CARD)),
+                   cards={"U1.vcf": FakeResponse(other, status_code=200)})
+    server.update_contact("U1", name="Ann Smith-Jones", dry_run=False)
+    assert "UID:U1" in http.writes[0]["body"]
+
+
+def test_uid_is_quoted_into_the_card_url():
+    http = install(FakeResponse(collections_xml("card")), FakeResponse(report_xml()))
+    with pytest.raises(ToolError, match="No contact found"):
+        server.update_contact("../../etc/passwd", name="X")
+    [get] = [c for c in http.calls if c["method"] == "GET"]
+    assert get["url"].endswith("/card/..%2F..%2Fetc%2Fpasswd.vcf")
 
 
 def test_update_only_touches_requested_fields():

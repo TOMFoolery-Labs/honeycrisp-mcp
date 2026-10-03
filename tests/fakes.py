@@ -380,9 +380,10 @@ def vcard(fn, emails=(), phones=(), n=None, org=None, uid=None):
 
 
 class FakeResponse:
-    def __init__(self, text, status_code=207):
+    def __init__(self, text, status_code=207, headers=None):
         self.text = text
         self.status_code = status_code
+        self.headers = dict(headers or {})
 
 
 class FakeHTTP:
@@ -392,13 +393,16 @@ class FakeHTTP:
     can assert on exactly what would hit the server.
     """
 
-    def __init__(self, responses, put_status=204, delete_status=204):
+    def __init__(self, responses, put_status=204, delete_status=204, cards=None):
         self.responses = list(responses)
         self.calls = []
         self.writes = []
         self.deletes = []
         self.put_status = put_status
         self.delete_status = delete_status
+        # Direct GETs of <addressbook>/<name>.vcf are answered from here by
+        # file name, and with 404 when absent, the way iCloud answers them.
+        self.cards = dict(cards or {})
 
     def __call__(self, method, url, **kwargs):
         self.calls.append({
@@ -422,6 +426,8 @@ class FakeHTTP:
                 "if_match": (kwargs.get("headers") or {}).get("If-Match"),
             })
             return FakeResponse("", status_code=self.delete_status)
+        if method == "GET":
+            return self.cards.get(url.rsplit("/", 1)[-1], FakeResponse("", status_code=404))
         if not self.responses:
             raise AssertionError(f"unexpected extra request: {method} {url}")
         return self.responses.pop(0)

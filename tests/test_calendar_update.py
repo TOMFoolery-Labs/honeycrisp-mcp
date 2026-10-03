@@ -140,7 +140,10 @@ def test_moving_start_keeps_the_duration_and_preserves_everything_else(isolate_b
     [save] = event.saved
     assert save["only_this_recurrence"] is False, "we hold the whole .ics; the library must not merge"
     data = save["data"]
-    assert "DTSTART:20260911T190000Z" in data and "DTEND:20260911T200000Z" in data
+    # Written back in the event's own zone, not UTC: a series anchored in a
+    # named zone must keep following that zone's DST changes.
+    assert "DTSTART;TZID=America/Chicago:20260911T140000" in data and "DTEND;TZID=America/Chicago:20260911T150000" in data
+    assert "T190000Z" not in data
     assert "SUMMARY:Dentist" in data and "LOCATION:12 Main St" in data
     assert "BEGIN:VALARM" in data and "TRIGGER:-PT15M" in data, "alarm preserved"
     assert "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC" in data, "custom property preserved"
@@ -155,7 +158,28 @@ def test_end_only_and_explicit_both():
     result = server.update_event("ABC-123", end="2026-09-10T12:00:00-05:00", dry_run=False)
     assert result["changes"] == ["end: 2026-09-10T11:00:00-05:00 -> 2026-09-10T12:00:00-05:00"]
     assert "DTSTART;TZID=America/Chicago:20260910T100000" in event.data, "untouched start keeps its TZID form"
-    assert "DTEND:20260910T170000Z" in event.data
+    assert "DTEND;TZID=America/Chicago:20260910T120000" in event.data
+
+
+def test_moving_a_utc_event_stays_in_utc():
+    ics = ICS.replace("DTSTART;TZID=America/Chicago:20260910T100000", "DTSTART:20260910T150000Z").replace(
+        "DTEND;TZID=America/Chicago:20260910T110000", "DTEND:20260910T160000Z")
+    event = target(data=ics)
+    use_calendars(FakeCalendar("Home", events=[event]))
+    server.update_event("ABC-123", start="2026-09-11T14:00:00-05:00", dry_run=False)
+    assert "DTSTART:20260911T190000Z" in event.data and "DTEND:20260911T200000Z" in event.data
+
+
+def test_moving_a_recurring_series_keeps_its_zone_across_dst():
+    # Weekly 10:00 Chicago. Moved to 11:00 in September, it must still be
+    # 11:00 Chicago in December; as UTC it would read 10:00 after the fall back.
+    ics = ICS.replace("SUMMARY:Dentist\r\n", "SUMMARY:Dentist\r\nRRULE:FREQ=WEEKLY\r\n")
+    event = target(data=ics)
+    use_calendars(FakeCalendar("Home", events=[event]))
+    server.update_event("ABC-123", start="2026-09-10T11:00:00-05:00", dry_run=False)
+    assert "RRULE:FREQ=WEEKLY" in event.data
+    assert "DTSTART;TZID=America/Chicago:20260910T110000" in event.data
+    assert "DTEND;TZID=America/Chicago:20260910T120000" in event.data
 
 
 def test_inverted_times_are_rejected_before_anything_is_touched():
@@ -201,7 +225,7 @@ def test_duration_based_events_are_converted_to_dtend():
     use_calendars(FakeCalendar("Home", events=[event]))
     result = server.update_event("ABC-123", start="2026-09-10T16:00:00Z", dry_run=False)
     assert result["before"]["end"] == "2026-09-10T10:30:00-05:00"
-    assert "DURATION" not in event.data and "DTEND:20260910T163000Z" in event.data
+    assert "DURATION" not in event.data and "DTEND;TZID=America/Chicago:20260910T113000" in event.data
 
 
 def test_edits_go_to_the_series_master_not_an_override():
