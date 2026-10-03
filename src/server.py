@@ -116,7 +116,8 @@ filters (sender, subject, since, unread, ...); get_email returns one in full and
 attachments, which save_attachments writes to disk. Message ids are specific to the folder \
 they were found in. send_email (with reply_to_id for replies), \
 forward_email, mark_emails, move_emails and delete_emails change the mailbox. delete_emails \
-moves to Trash unless permanent=True.
+moves to Trash unless permanent=True. After a send, check 'refused': a non-empty value means \
+the server turned those recipients away while delivering to the others.
 
 Calendar: list_calendars shows calendars and Reminders lists (kind 'reminders' cannot hold \
 events, and on accounts using upgraded Reminders those lists hold only Apple's placeholder \
@@ -956,7 +957,9 @@ def send_email(
     The message goes out over SMTP and a copy is then filed in the account's
     Sent folder so it appears in Mail on every device. Sending cannot be
     undone, so the default is a dry run that renders the message without
-    sending it.
+    sending it. If the server accepts some recipients and refuses others,
+    the message goes to the accepted ones and 'refused' lists the rest with
+    the server's reason; it is empty when everyone was accepted.
 
     To reply to a message, pass its 'id' from search_emails as reply_to_id.
     The reply is threaded onto the original (In-Reply-To and References), and
@@ -1020,6 +1023,7 @@ def send_email(
         "body": body,
         "in_reply_to": str(message["In-Reply-To"] or ""),
         "references": str(message["References"] or ""),
+        "refused": {},
     }
     if dry_run:
         return result
@@ -1028,15 +1032,25 @@ def send_email(
     return result
 
 
-def _deliver(message: EmailMessage, address: str, recipients: List[str]) -> Dict[str, bool]:
-    """Send over SMTP, then file a copy in Sent. Shared by send_email and forward_email."""
+def _deliver(message: EmailMessage, address: str, recipients: List[str]) -> Dict[str, Any]:
+    """Send over SMTP, then file a copy in Sent. Shared by send_email and forward_email.
+
+    smtplib raises only when every recipient is refused. When some are
+    accepted it returns the refused ones instead, and the message has gone
+    out to the rest, so those are reported alongside sent=True.
+    """
     smtp = _connect_smtp()
     try:
-        smtp.send_message(message, from_addr=address, to_addrs=recipients)
+        refused_raw = smtp.send_message(message, from_addr=address, to_addrs=recipients) or {}
     except smtplib.SMTPException as e:
         raise ToolError(f"SMTP rejected the message: {e}") from e
+    except OSError as e:
+        raise ToolError(f"SMTP connection to {SMTP_HOST} failed: {e}") from e
     finally:
         _quiet_quit(smtp)
+    refused = {addr: _smtp_reply(reply) for addr, reply in refused_raw.items()}
+    if refused:
+        log.warning("SMTP refused %d of %d recipients: %s", len(refused), len(recipients), refused)
 
     # iCloud's SMTP does not file outgoing mail; clients APPEND it themselves.
     # The message has already left, so a failure here is reported, not raised.
@@ -1052,7 +1066,18 @@ def _deliver(message: EmailMessage, address: str, recipients: List[str]) -> Dict
                 saved = True
     except Exception as e:
         log.warning("Message sent but could not be filed in Sent: %s", e)
-    return {"sent": True, "saved_to_sent": saved}
+    return {"sent": True, "saved_to_sent": saved, "refused": refused}
+
+
+def _smtp_reply(reply: Any) -> str:
+    """Render smtplib's (code, message) pair for a refused recipient."""
+    try:
+        code, text = reply
+    except (TypeError, ValueError):
+        return str(reply)
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    return f"{code} {text}".strip()
 
 
 _FWD_PREFIX_RE = re.compile(r"(?i)^\s*(fwd?|wg|tr)\s*:\s*")
@@ -1076,6 +1101,7 @@ def forward_email(
     The forwarded copy carries your note (if any) above a 'Forwarded message'
     block with the original's From, Date, Subject and To, then the original
     text. Attachments are re-attached unless include_attachments is False.
+    'refused' in the result lists any recipients the server turned away.
 
     Args:
         message_id: The 'id' from search_emails.
@@ -1156,6 +1182,7 @@ def forward_email(
         "body": text,
         "attachments": attached,
         "forwarded_id": str(uid),
+        "refused": {},
     }
     if dry_run:
         return result
@@ -1881,10 +1908,15 @@ CARDDAV_401_RETRIES = 3
 CARDDAV_RETRY_DELAY = 1.5
 
 
-def _carddav_propfind(url: str, depth: int, body: str, auth: HTTPBasicAuth) -> ET.Element:
+def _carddav_request(method: str, url: str, depth: int, body: str, auth: HTTPBasicAuth) -> requests.Response:
+    """Issue one CardDAV request (PROPFIND or REPORT) and return its 2xx response.
+
+    Any other status raises, so a throttled or failing address book is
+    reported rather than quietly contributing nothing to the result.
+    """
     for attempt in range(CARDDAV_401_RETRIES + 1):
         response = requests.request(
-            "PROPFIND", url,
+            method, url,
             auth=auth,
             headers={"Depth": str(depth), "Content-Type": "application/xml; charset=utf-8"},
             data=body.encode("utf-8"),
@@ -1892,19 +1924,25 @@ def _carddav_propfind(url: str, depth: int, body: str, auth: HTTPBasicAuth) -> E
         )
         if response.status_code != 401 or attempt == CARDDAV_401_RETRIES:
             break
-        log.warning("CardDAV PROPFIND %s returned 401; retrying (%d/%d).", url, attempt + 1, CARDDAV_401_RETRIES)
+        log.warning("CardDAV %s %s returned 401; retrying (%d/%d).", method, url, attempt + 1, CARDDAV_401_RETRIES)
         time.sleep(CARDDAV_RETRY_DELAY)
     if response.status_code == 401 and url.rstrip("/") != CARDDAV_URL.rstrip("/"):
-        # The root answered with these same credentials a moment ago, so this
-        # is the partition throttling the account, not a bad password.
+        # The root answered with these same credentials (at discovery, which is
+        # cached), so this is the partition throttling the account, not a bad
+        # password. Discovery is re-run once the cache expires, and a genuinely
+        # bad password is reported from there.
         raise ToolError(
             "iCloud is temporarily rejecting CardDAV requests for this account (HTTP 401 on "
             f"{url}) even though the credentials were just accepted. This clears on its own, "
             "typically within minutes; try again later."
         )
     if response.status_code not in (200, 207):
-        raise ToolError(f"CardDAV PROPFIND failed ({response.status_code}): {response.text[:200]}")
-    return ET.fromstring(response.text)
+        raise ToolError(f"CardDAV {method} failed ({response.status_code}): {response.text[:200]}")
+    return response
+
+
+def _carddav_propfind(url: str, depth: int, body: str, auth: HTTPBasicAuth) -> ET.Element:
+    return ET.fromstring(_carddav_request("PROPFIND", url, depth, body, auth).text)
 
 
 # Some cards in the wild have a metadata property concatenated onto the end of
@@ -2118,16 +2156,9 @@ def _fetch_cards(auth: HTTPBasicAuth, query: str = "") -> List[Card]:
 
     cards: List[Card] = []
     for addressbook_url in _addressbook_urls(auth):
-        response = requests.request(
-            "REPORT", addressbook_url,
-            auth=auth,
-            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
-            data=report_body.encode("utf-8"),
-            timeout=HTTP_TIMEOUT,
-        )
-        if response.status_code not in (200, 207):
-            log.warning("CardDAV REPORT failed for %s (%s)", addressbook_url, response.status_code)
-            continue
+        # A failed REPORT raises. Skipping the book would turn a throttled
+        # account into an empty search, or "no contact found" on a write.
+        response = _carddav_request("REPORT", addressbook_url, 1, report_body, auth)
 
         for entry in ET.fromstring(response.text).findall('{DAV:}response'):
             data = entry.find('.//{urn:ietf:params:xml:ns:carddav}address-data')
@@ -2350,23 +2381,61 @@ def _summarise(raw: str) -> Dict[str, Any]:
     }
 
 
+def _unfold(lines: List[str]) -> List[str]:
+    """Join folded continuation lines back onto their property line."""
+    out: List[str] = []
+    for line in lines:
+        if line[:1] in (" ", "\t") and out:
+            out[-1] += line[1:]
+        else:
+            out.append(line)
+    return out
+
+
+def _summarise_from_lines(raw: str) -> Dict[str, Any]:
+    """Summarise a card straight off its lines, without vobject."""
+    lines = _unfold(_split_vcard(raw)[0])
+    name, organization = "", ""
+    emails: List[str] = []
+    phones: List[str] = []
+    for line in lines:
+        prop = _property_name(line)
+        value = line.partition(":")[2]
+        if prop == "FN" and not name and value.strip():
+            name = _vcard_unescape(value.strip())
+        elif prop == "ORG" and not organization:
+            organization = _WS_RE.sub(" ", " ".join(p for p in _split_components(value) if p)).strip()
+        elif prop in ("EMAIL", "TEL"):
+            cleaned = _vcard_unescape(_clean_value(value)[0])
+            if cleaned:
+                (emails if prop == "EMAIL" else phones).append(cleaned)
+    return {
+        "id": _card_uid(raw),
+        "name": name or _name_from_lines(lines),
+        "organization": organization,
+        "emails": emails,
+        "phones": phones,
+    }
+
+
+def _is_vcard(raw: str) -> bool:
+    """True when the text has a BEGIN:VCARD line; junk from the server does not."""
+    return any(_property_name(line) == "BEGIN" and line.partition(":")[2].strip().upper() == "VCARD"
+               for line in _split_vcard(raw)[0])
+
+
 def _summarise_safely(raw: str) -> Dict[str, Any]:
     """Summarise a card that may not fully parse.
 
-    A single card with, say, an undecodable inline photo must not abort a whole
-    repair run, so fall back to what can be read straight off the lines.
+    A card with, say, an undecodable inline photo must still be searchable,
+    editable and repairable, so when vobject rejects it the summary is read
+    straight off the lines instead.
     """
     try:
         return _summarise(raw)
     except Exception as e:
         log.debug("Falling back to line-level summary: %s", e)
-        name = ""
-        for line in _split_vcard(raw)[0]:
-            if _property_name(line) == "FN" and line.partition(":")[2].strip():
-                name = line.partition(":")[2].strip()
-                break
-        return {"id": _card_uid(raw), "name": name, "organization": "",
-                "emails": [], "phones": []}
+        return _summarise_from_lines(raw)
 
 
 def _backup(cards: List[Tuple[Card, str]]) -> str:
@@ -2411,11 +2480,12 @@ def search_contacts(query: str = "", limit: int = 10) -> List[Dict[str, Any]]:
     try:
         results: List[Dict[str, Any]] = []
         for card in _fetch_cards(auth, query):
-            try:
-                results.append(_summarise(card.raw))
-            except Exception as e:
-                log.warning("Skipping unparseable vCard at %s: %s", card.url, e)
+            # A card vobject cannot parse still has a name, emails and phones
+            # on its lines; dropping it would hide the contact from the model.
+            if not _is_vcard(card.raw):
+                log.warning("Skipping non-vCard data at %s", card.url)
                 continue
+            results.append(_summarise_safely(card.raw))
             if len(results) >= limit:
                 break
         return results
@@ -2470,6 +2540,10 @@ def update_contact(
     if not changes:
         return {"contact_id": contact_id, "changed": False, "changes": [], "dry_run": dry_run}
 
+    # Summarise before writing: once the PUT has gone through, nothing may
+    # raise, or a successful edit would be reported as a failure.
+    before, after = _summarise_safely(match.raw), _summarise_safely(updated)
+
     if not dry_run:
         _backup([(match, updated)])
         _put_card(auth, match, updated)
@@ -2479,8 +2553,8 @@ def update_contact(
         "changed": not dry_run,
         "dry_run": dry_run,
         "changes": changes,
-        "before": _summarise(match.raw),
-        "after": _summarise(updated),
+        "before": before,
+        "after": after,
     }
 
 

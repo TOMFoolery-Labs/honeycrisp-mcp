@@ -136,6 +136,22 @@ def test_repair_limit_is_respected():
     assert server.repair_contacts(limit=2)["needing_repair"] == 2
 
 
+def test_update_of_a_card_vobject_cannot_parse_succeeds_and_reports_it():
+    # Previously the PUT went through and the result-building _summarise then
+    # raised, so a successful edit was reported as a failure (and a retry 412d).
+    http = install(FakeResponse(collections_xml("card")), FakeResponse(report_xml(CORRUPT)))
+    with pytest.raises(Exception):
+        server._summarise(CORRUPT)
+    result = server.update_contact("11111111-2222-3333-4444-555555555555", name="Dana Whitfield", dry_run=False)
+    assert result["changed"] is True
+    assert result["changes"] == ["FN '' -> 'Dana Whitfield'"]
+    assert result["before"]["name"] == "Dana Whitfield", "fell back to N on the lines"
+    assert result["after"]["name"] == "Dana Whitfield"
+    assert result["after"]["phones"] == ["+12025550143"]
+    [write] = http.writes
+    assert "FN:Dana Whitfield\r\n" in write["body"]
+
+
 # --------------------------------------------------------------------------
 # update_contact
 # --------------------------------------------------------------------------

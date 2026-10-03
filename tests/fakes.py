@@ -151,16 +151,19 @@ class FakeIMAP:
 class FakeSMTP:
     """Records what would have gone out over SMTP."""
 
-    def __init__(self, error=None):
+    def __init__(self, error=None, refused=None):
         self.sent = []
         self.error = error
+        # smtplib's partial-failure contract: when at least one recipient is
+        # accepted, send_message returns {addr: (code, message)} for the rest.
+        self.refused = dict(refused or {})
         self.quit_called = False
 
     def send_message(self, msg, from_addr=None, to_addrs=None):
         if self.error:
             raise self.error
         self.sent.append({"message": msg, "from": from_addr, "to": list(to_addrs or [])})
-        return {}
+        return dict(self.refused)
 
     def quit(self):
         self.quit_called = True

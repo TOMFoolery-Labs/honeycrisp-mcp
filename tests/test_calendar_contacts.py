@@ -246,6 +246,47 @@ def test_unparseable_vcards_are_skipped_not_fatal():
     assert [r["name"] for r in server.search_contacts()] == ["Ann"]
 
 
+# A card vobject cannot decode (truncated inline photo, as seen live). It must
+# still come back from search with everything readable off its lines.
+PHOTO_CARD = (
+    "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:\r\nN:Whitfield;Dana;;;\r\nUID:PHOTO-1\r\nORG:Acme\\, Inc.;\r\n"
+    "PHOTO;ENCODING=b;TYPE=JPEG:/9j/4AAQSkZJRgABAQAAAQABAAD\r\n"
+    " AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+    "EMAIL;TYPE=INTERNET:dana@example.com\r\nTEL;TYPE=CELL:+12025550143X-SHARED-PHOTO-DISPLAY-PREF:ALWAYS_ASK\r\n"
+    "END:VCARD\r\n"
+)
+
+
+def test_card_vobject_cannot_parse_is_still_searchable():
+    install_http(FakeResponse(collections_xml("card")), FakeResponse(report_xml(PHOTO_CARD, vcard("Ann"))))
+    with pytest.raises(Exception):
+        server._summarise(PHOTO_CARD)  # the premise: vobject rejects this card
+    results = server.search_contacts()
+    assert [r["name"] for r in results] == ["Dana Whitfield", "Ann"]
+    dana = results[0]
+    assert dana["id"] == "PHOTO-1"
+    assert dana["organization"] == "Acme, Inc."
+    assert dana["emails"] == ["dana@example.com"]
+    assert dana["phones"] == ["+12025550143"], "the glued metadata is stripped as on the vobject path"
+
+
+def test_throttled_report_raises_instead_of_returning_nothing(monkeypatch):
+    # Discovery is cached, so the REPORT is the request that meets the 401
+    # throttle. An empty result here would read as "no contacts match".
+    monkeypatch.setattr(server, "CARDDAV_RETRY_DELAY", 0)
+    http = install_http(FakeResponse(collections_xml("card")),
+                        *[FakeResponse("", status_code=401)] * (server.CARDDAV_401_RETRIES + 1))
+    with pytest.raises(ToolError, match="temporarily rejecting"):
+        server.search_contacts("Dana")
+    assert [c["method"] for c in http.calls].count("REPORT") == server.CARDDAV_401_RETRIES + 1
+
+
+def test_failed_report_raises():
+    install_http(FakeResponse(collections_xml("card")), FakeResponse("boom", status_code=500))
+    with pytest.raises(ToolError, match="REPORT failed \\(500\\)"):
+        server.search_contacts()
+
+
 def test_limit_is_respected():
     http = install_http(
         FakeResponse(collections_xml("card")),

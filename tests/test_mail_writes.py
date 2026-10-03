@@ -216,6 +216,7 @@ def test_send_dry_run_is_the_default_and_renders_without_connecting():
         "body": "Hello Ann",
         "in_reply_to": "",
         "references": "",
+        "refused": {},
     }
 
 
@@ -292,6 +293,35 @@ def test_smtp_rejection_raises_and_files_nothing():
         server.send_email(to=["ann@example.com"], subject="s", body="b", dry_run=False)
     assert smtp.quit_called, "connection leaked on the error path"
     assert not imap.appended
+
+
+def test_partially_refused_recipients_are_reported_with_the_send():
+    # smtplib raises only when every recipient is refused; otherwise the mail
+    # goes to the accepted ones and the refused are returned, not raised.
+    smtp = FakeSMTP(refused={"bob@example.com": (550, b"5.1.1 No such user")})
+    server._connect_smtp = lambda: smtp
+    imap = mailbox()
+    result = server.send_email(to=["ann@example.com", "bob@example.com"], subject="s", body="b", dry_run=False)
+    assert result["sent"] is True
+    assert result["refused"] == {"bob@example.com": "550 5.1.1 No such user"}
+    assert imap.appended, "the copy that did go out is still filed in Sent"
+
+
+def test_fully_accepted_send_reports_no_refusals():
+    smtp = FakeSMTP()
+    server._connect_smtp = lambda: smtp
+    mailbox()
+    result = server.send_email(to=["ann@example.com"], subject="s", body="b", dry_run=False)
+    assert result["refused"] == {}
+
+
+def test_smtp_socket_failure_is_a_tool_error():
+    smtp = FakeSMTP(error=TimeoutError("timed out"))
+    server._connect_smtp = lambda: smtp
+    imap = mailbox()
+    with pytest.raises(ToolError, match="SMTP connection"):
+        server.send_email(to=["ann@example.com"], subject="s", body="b", dry_run=False)
+    assert smtp.quit_called and not imap.appended
 
 
 def test_sent_folder_failure_is_reported_not_raised():
